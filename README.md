@@ -131,11 +131,38 @@ pulse <name> <us>                    pulse a pin away from its idle level
 ```
 
 ```powershell
-pip install -r host\requirements.txt
-python host\scum.py                     # interactive
-python host\scum.py power up
-python host\scum.py cap 65536 -o iq     # -> iq.npz
+python -m venv .venv; .venv\Scripts\pip install -r host\requirements.txt
+.venv\Scripts\python host\scum.py                     # interactive
+.venv\Scripts\python host\scum.py power up
+.venv\Scripts\python host\scum.py cap 65536 -o iq     # -> iq.npz
 ```
+
+## Desktop app
+
+```powershell
+.venv\Scripts\python host\scum_app.py          # connects to the board if it is plugged in
+.venv\Scripts\python host\scum_app.py --sim    # simulated board, no hardware needed
+```
+
+PySide6 + pyqtgraph, built on `scum.py`. The left column has DUT power (sequenced up/down,
+single rails, source switches, VBAT set and closed-loop trim), the DUT clock counter, and
+the board's event counters. The tabs are:
+
+- **Telemetry**: live INA237 table (0.5 s poll), per-rail trip limits, a 10-minute strip
+  chart, and the TLA2528 channels.
+- **ADC capture**: ADC init, mode, test pattern and registers; capture, time and spectrum
+  plots, save to `.npz`.
+- **DUT I/O**: every control pin by name (drive, pulse), plus DUT reset and BOOT_SEL.
+- **DUT UART**: a terminal on the DUT's serial port, through the board.
+- **Console**: every line to and from the board, and a prompt for raw commands.
+
+An over-current trip raises a red banner and marks the tripped rail. Ctrl+Shift+D powers
+the DUT down from anywhere in the window.
+
+One worker thread owns the serial port (`host/app/link.py`): the GUI queues functions of the
+`Board` and gets results back as Qt signals, and the worker collects `!` events while it is
+idle. `host/sim.py` answers the same protocol, with replies formatted as the firmware formats
+them, so the app and scripts can be worked on without a board (`scum.py --sim` too).
 
 ## How the hard parts work
 

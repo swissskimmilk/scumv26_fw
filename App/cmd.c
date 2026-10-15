@@ -16,7 +16,7 @@
 #include "telemetry.h"
 
 #define FW_VERSION "0.1.0"
-#define MAX_ARGS 10
+#define MAX_ARGS 32
 
 static bool cmd_help(int argc, char **argv);
 
@@ -84,7 +84,11 @@ void cmd_execute(char *line)
 {
   char *argv[MAX_ARGS];
   int argc = 0;
-  for (char *tok = strtok(line, " \t"); tok && argc < MAX_ARGS; tok = strtok(NULL, " \t")) {
+  for (char *tok = strtok(line, " \t"); tok; tok = strtok(NULL, " \t")) {
+    if (argc == MAX_ARGS) {
+      cmd_err("more than %d words", MAX_ARGS); /* never act on a silently cut-off line */
+      return;
+    }
     argv[argc++] = tok;
   }
   if (argc == 0) {

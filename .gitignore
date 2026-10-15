@@ -2,3 +2,5 @@ build/
 .mxproject
 host/__pycache__/
 *.npz
+.venv/
+host/app/__pycache__/
