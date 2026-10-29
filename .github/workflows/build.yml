@@ -1,0 +1,118 @@
+# Tests on every push and pull request; app builds for Windows and macOS on pushes to main and
+# on tags. A tag v* also publishes a GitHub release with the Windows installer and the Mac disk image.
+#   git tag v0.2.0 && git push origin v0.2.0
+# The FPGA is not built here: Vivado does not fit on a hosted runner. Build it locally
+# (fpga/README.md) and attach out/scum_top.bit and .bin to the release by hand.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: host/requirements.txt
+      - run: pip install -r host/requirements.txt pytest
+      - run: python -m pytest host/tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  app:
+    needs: test
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows
+          - os: macos-latest   # Apple silicon
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: host/requirements.txt
+      - run: pip install -r host/requirements.txt pyinstaller
+      - name: Version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0-${GITHUB_SHA::7}"; fi
+          echo "APP_VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          .\packaging\build_app.ps1 -Version $env:APP_VERSION
+          if (-not (Get-ChildItem dist\*-windows-setup.exe)) { throw "no installer built" }
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\SCuMV26\SCuMV26.exe -ArgumentList "--sim" -PassThru
+          Start-Sleep 8
+          if ($p.HasExited) { throw "the app exited at start-up (code $($p.ExitCode))" }
+          Stop-Process $p -Force
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x packaging/build_app.sh
+          ./packaging/build_app.sh "$APP_VERSION"
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dist/SCuMV26.app/Contents/MacOS/SCuMV26 --sim &
+          pid=$!
+          sleep 8
+          kill -0 $pid || { echo "the app exited at start-up"; exit 1; }
+          kill $pid
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SCuMV26-${{ matrix.artifact }}
+          path: |
+            dist/*-windows-setup.exe
+            dist/*-macos.dmg
+          if-no-files-found: error
+
+  release:
+    needs: app
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes
