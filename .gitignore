@@ -1,6 +1,16 @@
-build/
-.mxproject
-host/__pycache__/
-*.npz
 .venv/
-host/app/__pycache__/
+__pycache__/
+*.npz
+# app builds (packaging/)
+build/
+dist/
+# Vivado
+fpga/out/
+fpga/sim/work/
+.Xil/
+*.jou
+*.log
+usage_statistics_webtalk.*
+clockInfo.txt
+tight_setup_hold_pins.txt
+.pytest_cache/

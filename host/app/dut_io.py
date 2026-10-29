@@ -1,4 +1,5 @@
-"""DUT I/O tab: every DUT control pin by name, plus reset/boot shortcuts."""
+"""DUT I/O tab: every DUT control pin by name, plus reset/boot shortcuts. Every pad is
+bidirectional in the FPGA, so each row's direction button turns the pin around."""
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QCheckBox, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
@@ -66,7 +67,12 @@ class DutIoTab(QWidget):
             for n in ns:
                 self.table.setItem(r, 0, QTableWidgetItem(group))
                 self.table.setItem(r, 1, QTableWidgetItem(n))
-                self.table.setItem(r, 2, QTableWidgetItem("?"))
+                d = QPushButton("?")
+                d.setFixedWidth(48)
+                d.setToolTip("FPGA drives the pin (out) or reads it (in); click to turn it around")
+                d.clicked.connect(lambda _=False, n=n: self._then_refresh(
+                    "pin %s %s" % (n, "in" if self.dirs.get(n) else "out")))
+                self.table.setCellWidget(r, 2, d)
                 cell = QWidget()
                 cl = QHBoxLayout(cell)
                 cl.setContentsMargins(6, 0, 6, 0)
@@ -76,7 +82,7 @@ class DutIoTab(QWidget):
                 cl.addWidget(lvl)
                 cl.addStretch(1)
                 self.table.setCellWidget(r, 3, cell)
-                self.rows[n] = (r, led, lvl)
+                self.rows[n] = (r, led, lvl, d, self._actions(n, r))
                 r += 1
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -84,31 +90,30 @@ class DutIoTab(QWidget):
         lay.addWidget(self.table, 1)
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh(quiet=True))
-        self._actions_built = False
+        self.dirs = {}  # pin -> is_output, as last read
         self._refreshing = False
 
     def _then_refresh(self, line):
         self.link.cmd(line, lambda _: self.refresh())
 
-    def _build_actions(self, pins):
-        for n, (is_out, _) in pins.items():
-            if n not in self.rows or not is_out:
-                continue
-            cell = QWidget()
-            cl = QHBoxLayout(cell)
-            cl.setContentsMargins(4, 0, 4, 0)
-            for label, line in (("0", "pin %s 0"), ("1", "pin %s 1")):
-                b = QPushButton(label)
-                b.setFixedWidth(32)
-                b.clicked.connect(lambda _=False, l=line % n: self._then_refresh(l))
-                cl.addWidget(b)
-            p = QPushButton("Pulse")
-            p.clicked.connect(lambda _=False, n=n: self._then_refresh(
-                "pulse %s %d" % (n, self.pulse_us.value())))
-            cl.addWidget(p)
-            cl.addStretch(1)
-            self.table.setCellWidget(self.rows[n][0], 4, cell)
-        self._actions_built = True
+    def _actions(self, n, row):
+        """Drive 0 / 1 / pulse buttons for one pin; enabled while it is an output."""
+        cell = QWidget()
+        cl = QHBoxLayout(cell)
+        cl.setContentsMargins(4, 0, 4, 0)
+        for label, line in (("0", "pin %s 0"), ("1", "pin %s 1")):
+            b = QPushButton(label)
+            b.setFixedWidth(32)
+            b.clicked.connect(lambda _=False, l=line % n: self._then_refresh(l))
+            cl.addWidget(b)
+        p = QPushButton("Pulse")
+        p.clicked.connect(lambda _=False, n=n: self._then_refresh(
+            "pulse %s %d" % (n, self.pulse_us.value())))
+        cl.addWidget(p)
+        cl.addStretch(1)
+        cell.setEnabled(False)
+        self.table.setCellWidget(row, 4, cell)
+        return cell
 
     def refresh(self, quiet=False):
         if self._refreshing:
@@ -117,13 +122,13 @@ class DutIoTab(QWidget):
 
         def show(pins):
             self._refreshing = False
-            if not self._actions_built:
-                self._build_actions(pins)
             for n, (is_out, level) in pins.items():
                 if n not in self.rows:
                     continue
-                r, led, lvl = self.rows[n]
-                self.table.item(r, 2).setText("out" if is_out else "in")
+                r, led, lvl, d, actions = self.rows[n]
+                self.dirs[n] = is_out
+                d.setText("out" if is_out else "in")
+                actions.setEnabled(is_out)
                 led.on(level)
                 lvl.setText("1" if level else "0")
             if "BOOT_SEL" in pins:

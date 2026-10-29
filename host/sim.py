@@ -1,412 +1,193 @@
-"""A simulated bring-up board, for developing the host tools without hardware.
+"""A simulated FPGA board, for developing the host tools without hardware.
 
-SimSerial stands in for the pyserial port: it answers the firmware's text protocol with
-replies formatted exactly as the firmware formats them (see App/*.c), from a crude model of
-the board: rails that follow their enables, currents with noise, INA237 over-current trips,
-a DUT clock, an ADC that sees two tones (or the test pattern), and a DUT that prints on its
-UART while powered.
+SimFpga stands in for the D2XX device on the FT2232H's channel B: it takes the host packets
+(fpga/regmap.py) and answers them from a model of the gateware's registers, behaving as the
+RTL does: rail enables that a trip clears and holds off, w1c event flags, cumulative counters,
+a DUT clock counter whose windows complete in real time, pads released while VIO is off, and
+timed pulses.
 
     from scum import Board
-    from sim import SimSerial
-    b = Board(transport=SimSerial())
+    from sim import SimFpga
+    b = Board(transport=SimFpga())
+
+Set `alert = True` on the SimFpga to pull TELEM_ALERT, as an INA237 over its limit would.
 """
-import math
 import random
+import struct
+import sys
 import time
-import zlib
+from pathlib import Path
 
-import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "fpga"))
+import regmap as rm  # noqa: E402
 
-FW_ID = "scumv26_fw 0.1.0-sim Oct 14 2026 00:00:00 uid 00000000SIMULATED0000"
-
-VFB, R_TOP, R_BOT, R_DAC, DAC_VREF, DAC_MAX = 0.8, 10e3, 13.7e3, 36.4e3, 1.8, 4095
-DAC_LO, DAC_HI = int(0.2 / DAC_VREF * DAC_MAX), int((DAC_VREF - 0.2) / DAC_VREF * DAC_MAX)
-
-MONS = [("vio", 0x40, 2.0), ("vbat", 0x41, 0.82), ("vbat_rf", 0x45, 1.8),
-        ("vddd", 0x43, 1.8), ("vdda", 0x44, 5.6), ("rf_vdd", 0x47, 1.8)]
-LOAD_MA = {"vio": 0.4, "vbat": 2.5, "vbat_rf": 0.9, "vddd": 7.5, "vdda": 1.8, "rf_vdd": 3.2}
-
-PINS = [("CORE_RST", True), ("BOOT_SEL", True), ("CORE_GPIO", False), ("CLK_DEBUG_MUX", True),
-        ("SCAN_CLK", True), ("SCAN_IN", True), ("SCAN_EN", True), ("SCAN_SEL", True),
-        ("SCAN_RST", True), ("SCAN_OUT", False), ("TL_CLK", True), ("TL_VAL_IN", True),
-        ("TL_DAT_IN", True), ("RDY_OUT", True), ("TL_VAL_OUT", False), ("TL_DAT_OUT", False),
-        ("RDY_IN", False), ("BASEBAND_TX", False), ("BASEBAND_RX", False),
-        ("NFC_DEMOD_MCU", False), ("NFC_MDM_DBG", False)]
-
-AUX = ["VNFC", "PWR_BG", "PWR_TEST_0", "PWR_I_REF", "VIO", "PWR_VDD_RF", "SPARE_1", "SPARE_2"]
-MODES = ["ddr-a", "ddr-b", "sdr-a", "sdr-b"]
-FS = 32e6
+A = {name: addr for name, addr, *_ in rm.REGS}
+F = {name: {f: 1 << lsb for f, (lsb, _, _) in fields.items()} for name, _, _, _, _, fields in rm.REGS}
+PIN = {name: i for i, (name, *_) in enumerate(rm.DUT_PINS)}
+CLK_HZ = {1: 20e6, 2: 2.4e6}  # what the DUT puts out on dig_out / ana_out while it is powered
+PKT_LEN = {rm.CMD_WRITE: 7, rm.CMD_READ: 3, rm.CMD_BURST: 7}
 
 
-class CmdError(Exception):
-    pass
-
-
-def vbat_from_dac(code):
-    vdac = code * DAC_VREF / DAC_MAX
-    return VFB + R_TOP * (VFB / R_BOT - (vdac - VFB) / R_DAC)
-
-
-def dac_from_vbat(v):
-    return round((VFB + R_DAC * (VFB / R_BOT - (v - VFB) / R_TOP)) / DAC_VREF * DAC_MAX)
-
-
-class SimSerial:
-    def __init__(self):
-        self._out = bytearray()
-        self._in = b""
+class SimFpga:
+    def __init__(self, features=rm.FEATURES):
+        self._rx = bytearray()   # host -> board
+        self._tx = bytearray()   # board -> host
         self._t0 = time.monotonic()
-        self.en = {"vio": False, "vbat": False, "1v": False}
-        self.sw = {"vddd": True, "vdda": True, "rf": True}  # True = board
-        self.dac = round(VFB / DAC_VREF * DAC_MAX)
-        self.ilim = {m[0]: 0.0 for m in MONS}
-        self.counters = dict.fromkeys(
-            ["ocp_trips", "capture_errors", "uart_dropped", "host_dropped", "button_resets"], 0)
-        self.ocp_rails = []
-        self.clk = {"sel": "dig", "psc": 4, "win": 100}
-        self.pins = {n: (out, n == "CORE_RST") for n, out in PINS}
-        self.adc_mode = 0
-        self.pattern = None
-        self.regs = {0x39: 0x00}
-        self.uart_buf = bytearray()
-        self._uart_next = time.monotonic()
-        self._boots = 0
+        self.features = features
+        self.alert = False
+        self.reg = {name: reset for name, _, _, reset, _, _ in rm.REGS}
+        self.counts = {"TRIP_COUNT": 0, "BUTTON_COUNT": 0, "FRAME_COUNT": 0}
+        self.tripped = False
+        self.pulse_end = 0.0
+        self.pulse_mask = 0
+        self._clk_restart()
 
-    # ---- pyserial surface ---------------------------------------------------------------
+    # ---- D2XX device interface ----------------------------------------------------------
 
-    @property
-    def in_waiting(self):
-        self._tick()
-        return len(self._out)
+    def write(self, data):
+        self._rx += data
+        while self._rx:
+            n = PKT_LEN.get(self._rx[0])
+            if n is None:  # not a packet start: the bridge drops it and counts it
+                self._event("FRAME")
+                del self._rx[0]
+                continue
+            if len(self._rx) < n:
+                break
+            pkt, self._rx = bytes(self._rx[:n]), self._rx[n:]
+            self._packet(pkt)
+        return len(data)
 
-    def reset_input_buffer(self):
-        self._out.clear()
+    def read(self, n):
+        out, self._tx = bytes(self._tx[:n]), self._tx[n:]
+        return out
+
+    def purge(self, *_):
+        self._rx.clear()
+        self._tx.clear()
 
     def close(self):
         pass
 
-    def write(self, data):
-        self._in += data
-        while b"\n" in self._in:
-            line, self._in = self._in.split(b"\n", 1)
-            self._execute(line.decode(errors="replace"))
-        return len(data)
+    def setTimeouts(self, *_):
+        pass
 
-    def readline(self):
-        self._tick()
-        i = self._out.find(b"\n")
-        n = len(self._out) if i < 0 else i + 1
-        data = bytes(self._out[:n])
-        del self._out[:n]
-        return data
+    def setLatencyTimer(self, *_):
+        pass
 
-    def read(self, n):
-        data = bytes(self._out[:n])
-        del self._out[:n]
-        return data
+    def setUSBParameters(self, *_):
+        pass
 
-    # ---- model ------------------------------------------------------------------------
+    # ---- model --------------------------------------------------------------------------
 
-    def _emit(self, text):
-        self._out += text.encode()
+    def _now(self):
+        return time.monotonic() - self._t0
+
+    def _event(self, name):
+        self.reg["EVENTS"] |= F["EVENTS"][name]
+        self.counts[name + "_COUNT"] += 1
+
+    def _clk_restart(self):
+        self.clk_t0 = self._now()
+
+    def _update(self):
+        """Advance what the hardware does on its own: the trip and the pulse timer."""
+        # `alert` is the asserted state, so TRIP_CTRL.ACTIVE_HIGH does not matter here
+        if self.reg["TRIP_CTRL"] & F["TRIP_CTRL"]["EN"] and self.alert and not self.tripped:
+            self.tripped = True
+            self.reg["RAIL_EN"] = 0
+            self._event("TRIP")
+        if self.pulse_mask and self._now() >= self.pulse_end:
+            self.pulse_mask = 0
 
     def _powered(self):
-        return self.en["vio"] and self.en["vbat"] and self.en["1v"]
+        en = self.reg["RAIL_EN"]
+        return all(en & F["RAIL_EN"][r] for r in ("VIO", "VBAT", "VDD"))
 
-    def _mon(self, name):
-        """(vbus, mA) at a monitor; None never: every simulated monitor answers."""
-        vbat = vbat_from_dac(self.dac)
-        noise = random.gauss(0, 0.004)
-        if name == "vio":
-            return (1.8, LOAD_MA[name]) if self.en["vio"] else (0.0, 0.0)
-        if name in ("vbat", "vbat_rf"):
-            return (vbat - 0.001, LOAD_MA[name] + noise) if self.en["vbat"] else (0.0, 0.0)
-        sw = {"vddd": "vddd", "vdda": "vdda", "rf_vdd": "rf"}[name]
-        if self.sw[sw]:
-            if not self.en["1v"]:
-                return (0.0, 0.0)
-            load = LOAD_MA[name] * (1.6 if self._powered() else 0.2)
-            return (1.0, load + noise)
-        # DUT's own LDO drives the rail: the board regulator sees nothing.
-        return (0.95 if self.en["vbat"] else 0.0, 0.0)
+    def _pads(self):
+        """DUT_IN: driven pins read back what is driven; the DUT's outputs are modelled crudely
+        (SCAN_OUT follows SCAN_IN, CORE_GPIO toggles at 1 Hz) while it is powered."""
+        if not self.reg["RAIL_EN"] & F["RAIL_EN"]["VIO"]:
+            return 0
+        oe, out = self.reg["DUT_OE"], self.reg["DUT_OUT"] ^ self.pulse_mask
+        dut = 0
+        if self._powered():
+            dut |= (out >> PIN["SCAN_IN"] & 1) << PIN["SCAN_OUT"]
+            dut |= (int(self._now()) & 1) << PIN["CORE_GPIO"]
+        return (out & oe) | (dut & ~oe)
 
-    def _tick(self):
-        now = time.monotonic()
-        tripped = [n for n, *_ in MONS if self.ilim[n] > 0 and self._mon(n)[1] > self.ilim[n]]
-        if tripped:
-            self.en = dict.fromkeys(self.en, False)
-            self.counters["ocp_trips"] += 1
-            self.ocp_rails = sorted(set(self.ocp_rails) | set(tripped))
-            self._emit("! ALERT: over-current trip, all DUT rails off: %s\n" % " ".join(tripped))
-        if self._powered() and now >= self._uart_next:
-            self._uart_next = now + 2.0
-            self._boots += 1
-            self.uart_buf += b"SCuM-V26 sim: heartbeat %d\r\n" % self._boots
+    def _clk(self, name):
+        win = self.reg["CLK_WINDOW"] / rm.SYS_HZ
+        n = int((self._now() - self.clk_t0) / win)
+        if name == "CLK_SEQ":
+            return max(0, n - 1)  # the first window after a restart is discarded
+        hz = CLK_HZ.get(self.reg["CLK_CTRL"] & 3, 0) if self._powered() else 0
+        return round(hz * (1 + random.gauss(0, 2e-6)) * win) if n >= 2 else 0
 
-    # ---- commands ---------------------------------------------------------------------
+    def _read(self, addr):
+        self._update()
+        name = next((k for k, v in A.items() if v == addr), None)
+        if name is None:
+            return 0
+        if name == "UPTIME_MS":
+            return int(self._now() * 1000) & 0xFFFFFFFF
+        if name in self.counts:
+            return self.counts[name]
+        if name == "FEATURES":
+            return self.features
+        if name == "TRIP_STATUS":
+            return (F["TRIP_STATUS"]["TRIPPED"] if self.tripped else 0) | \
+                   (F["TRIP_STATUS"]["ALERT"] if self.alert else 0)
+        if name in ("CLK_COUNT", "CLK_SEQ"):
+            return self._clk(name)
+        if name == "DUT_IN":
+            return self._pads()
+        if name == "DUT_PULSE":
+            return self.reg[name] | (1 << 31 if self.pulse_mask else 0)
+        return self.reg[name]
 
-    def _execute(self, line):
-        argv = line.split()[:32]
-        if not argv:
+    def _write(self, addr, value):
+        self._update()
+        name = next((k for k, v in A.items() if v == addr), None)
+        if name is None:
             return
-        fn = getattr(self, "cmd_" + argv[0], None)
-        if fn is None:
-            self._emit("ERR unknown command '%s' (try help)\n" % argv[0])
-            return
-        try:
-            if fn(argv) is not False:
-                self._emit("OK\n")
-        except CmdError as e:
-            self._emit("ERR %s\n" % e)
-        except (ValueError, IndexError):
-            self._emit("ERR bad arguments\n")
+        if name == "EVENTS":
+            self.reg[name] &= ~value
+        elif name == "TRIP_STATUS":
+            if value & F["TRIP_STATUS"]["TRIPPED"]:
+                self.tripped = False
+        elif name == "RAIL_EN":
+            if not self.tripped:
+                self.reg[name] = value & 7
+        elif name in ("CLK_CTRL", "CLK_WINDOW"):
+            self.reg[name] = value & 3 if name == "CLK_CTRL" else max(2, value)
+            self._clk_restart()
+        elif name == "DUT_PULSE":
+            if not self.pulse_mask and value & 0xFFFFFF:
+                self.reg[name] = value & 0x1FFFFFFF
+                self.pulse_mask = 1 << (value >> 24 & 0x1F)
+                self.pulse_end = self._now() + (value & 0xFFFFFF) / 1e6
+        elif name in ("RAIL_SW", "TRIP_CTRL", "SCRATCH", "DUT_OE", "DUT_OUT", "BUTTON_US"):
+            self.reg[name] = value
+        self._update()
 
-    def cmd_help(self, argv):
-        for name in sorted(n[4:] for n in dir(self) if n.startswith("cmd_")):
-            self._emit("  %s\n" % name)
-
-    def cmd_id(self, argv):
-        self._emit(FW_ID + "\n")
-
-    def cmd_status(self, argv):
-        peek = len(argv) == 2 and argv[1] == "peek"
-        self._emit("uptime_s %d\n" % (time.monotonic() - self._t0))
-        self._emit("mcu_reset pin\n")
-        self._emit("rails vio=%d vbat=%d 1v=%d\n" % (self.en["vio"], self.en["vbat"], self.en["1v"]))
-        self._emit("ocp_trips %d%s\n" % (self.counters["ocp_trips"],
-                                         "".join(" " + r for r in self.ocp_rails)))
-        for k in ("capture_errors", "uart_dropped", "host_dropped", "button_resets"):
-            self._emit("%s %d\n" % (k, self.counters[k]))
-        if not peek:
-            self.counters = dict.fromkeys(self.counters, 0)
-            self.ocp_rails = []
-
-    def _report(self, name):
-        v, ma = self._mon(name)
-        self._emit("  %-8s %.3f V  %.3f mA\n" % (name, v, ma))
-
-    def cmd_power(self, argv):
-        if argv[1:] == ["up"]:
-            self.en["vio"] = True
-            self._report("vio")
-            self.en["vbat"] = True
-            self._report("vbat")
-            self._report("vbat_rf")
-            self.en["1v"] = True
-            for n in ("vddd", "vdda", "rf_vdd"):
-                self._report(n)
-            time.sleep(0.06)
-        elif argv[1:] == ["down"]:
-            self.en = dict.fromkeys(self.en, False)
-            time.sleep(0.06)
+    def _packet(self, pkt):
+        if pkt[0] == rm.CMD_WRITE:
+            _, addr, value = struct.unpack("<BHI", pkt)
+            self._write(addr, value)
+            self._tx.append(rm.ACK)
+        elif pkt[0] == rm.CMD_READ:
+            _, addr = struct.unpack("<BH", pkt)
+            self._tx += struct.pack("<I", self._read(addr))
         else:
-            raise CmdError("usage: power up|down")
+            _, addr, n = struct.unpack("<BHI", pkt)
+            for _ in range(n):
+                self._tx += struct.pack("<I", self._read(addr))
 
-    def cmd_rail(self, argv):
-        if len(argv) == 1:
-            self._emit("vio  %s\nvbat %s\n1v   %s\n" % tuple(
-                "on" if self.en[k] else "off" for k in ("vio", "vbat", "1v")))
-            return
-        if len(argv) != 3 or argv[2] not in ("on", "off", "1", "0"):
-            raise CmdError("usage: rail vio|vbat|1v on|off")
-        if argv[1] not in self.en:
-            raise CmdError("unknown rail '%s'" % argv[1])
-        self.en[argv[1]] = argv[2] in ("on", "1")
-
-    def cmd_sw(self, argv):
-        if len(argv) == 1:
-            self._emit("vddd %s\nvdda %s\nrf   %s\n" % tuple(
-                "board" if self.sw[k] else "dut" for k in ("vddd", "vdda", "rf")))
-            return
-        if len(argv) != 3 or argv[2] not in ("board", "dut"):
-            raise CmdError("usage: sw vddd|vdda|rf board|dut")
-        if argv[1] not in self.sw:
-            raise CmdError("unknown switch '%s'" % argv[1])
-        self.sw[argv[1]] = argv[2] == "board"
-
-    def _dac_line(self):
-        self._emit("dac %d (%.4f V) -> VBAT set point %.4f V\n" % (
-            self.dac, self.dac * DAC_VREF / DAC_MAX, vbat_from_dac(self.dac)))
-
-    def cmd_vbat(self, argv):
-        if len(argv) == 2:
-            code = dac_from_vbat(float(argv[1]))
-            if not DAC_LO <= code <= DAC_HI:
-                raise CmdError("%.3f V is outside the trim range %.3f-%.3f V" % (
-                    float(argv[1]), vbat_from_dac(DAC_HI), vbat_from_dac(DAC_LO)))
-            self.dac = code
-        self._dac_line()
-
-    def cmd_dac(self, argv):
-        if len(argv) == 2:
-            code = int(argv[1], 0)
-            if not 0 <= code <= DAC_MAX:
-                raise CmdError("usage: dac [0-4095]")
-            self.dac = code
-        self._dac_line()
-
-    def cmd_trim(self, argv):
-        target = float(argv[1])
-        if not self.en["vbat"]:
-            raise CmdError("VBAT is off")
-        code = dac_from_vbat(target)
-        if not DAC_LO <= code <= DAC_HI:
-            raise CmdError("%.3f V is outside the trim range" % target)
-        self.dac = code + 9  # the open-loop guess is off by the resistor tolerances
-        for i in range(8):
-            time.sleep(0.08)
-            v = vbat_from_dac(self.dac) - 0.001
-            err = target - v
-            self._emit("  iter %d: dac %d  VBAT %.4f V  err %+.1f mV\n" % (i, self.dac, v, err * 1e3))
-            if abs(err) < 1e-3:
-                return
-            self.dac += round(err / (-R_TOP / R_DAC) / DAC_VREF * DAC_MAX)
-        raise CmdError("did not converge to 1 mV")
-
-    def cmd_tele(self, argv):
-        self._emit("rail      addr  shunt     Vbus      I         Vshunt\n")
-        for name, addr, shunt in MONS:
-            v, ma = self._mon(name)
-            self._emit("%-9s 0x%02X  %5.2f ohm  %7.4f V  %8.3f mA  %8.3f mV\n" % (
-                name, addr, shunt, v, ma, ma * shunt))
-
-    def cmd_ilim(self, argv):
-        if len(argv) == 1:
-            for name, *_ in MONS:
-                lim = self.ilim[name]
-                self._emit("%-9s %s\n" % (name, "%.2f mA" % lim if lim > 0 else "off"))
-            return
-        if len(argv) != 3 or argv[1] not in self.ilim or float(argv[2]) < 0:
-            raise CmdError("usage: ilim <vio|vbat|vbat_rf|vddd|vdda|rf_vdd> <mA>")
-        self.ilim[argv[1]] = float(argv[2])
-
-    def cmd_aux(self, argv):
-        p = self._powered()
-        vals = [0.42 if p else 0, 0.6 if p else 0, 0.31 if p else 0, 0.25 if p else 0,
-                1.8 if self.en["vio"] else 0, 1.0 if p else 0, 0.0, 0.0]
-        for ch, (name, v) in enumerate(zip(AUX, vals)):
-            self._emit("AIN%d %-11s %6.4f V\n" % (ch, name, max(0.0, v + random.gauss(0, 0.0008))))
-
-    def cmd_i2c(self, argv):
-        for a in sorted([0x10] + [m[1] for m in MONS]):
-            self._emit("0x%02X\n" % a)
-
-    def _clk_line(self):
-        c = self.clk
-        self._emit("sel %s  psc %d  win %d ms  resolution %.1f Hz\n" % (
-            c["sel"], c["psc"], c["win"], c["psc"] * 1000.0 / c["win"]))
-
-    def cmd_clk(self, argv):
-        if len(argv) % 2 == 0:
-            raise CmdError("usage: clk [sel dig|ana|off] [psc 1|2|4|8] [win ms]")
-        for k, v in zip(argv[1::2], argv[2::2]):
-            if k == "sel" and v in ("dig", "ana", "off"):
-                self.clk["sel"] = v
-            elif k == "psc" and v in ("1", "2", "4", "8"):
-                self.clk["psc"] = int(v)
-            elif k == "win" and 1 <= int(v) <= 6000:
-                self.clk["win"] = int(v)
-            else:
-                raise CmdError("bad option '%s %s'" % (k, v))
-        self._clk_line()
-
-    def cmd_freq(self, argv):
-        c = self.clk
-        hz = 0.0
-        if self._powered() and c["sel"] != "off":
-            hz = (20e6 if c["sel"] == "dig" else 2.4e6) * (1 + random.gauss(0, 2e-6))
-        counts = int(hz * c["win"] / 1000 / c["psc"])
-        hz = counts * c["psc"] * 1000.0 / c["win"]
-        time.sleep(min(c["win"], 300) / 1000)
-        self._emit("%.1f Hz  (%d counts x%d in %d ms)\n" % (hz, counts, c["psc"], c["win"]))
-
-    def cmd_adc(self, argv):
-        sub = argv[1] if len(argv) > 1 else ""
-        if sub in ("init", "reset"):
-            self.pattern = None
-            if sub == "init":
-                self._emit("ADC3910 ready, mode %s\n" % MODES[self.adc_mode])
-        elif sub == "rd":
-            a = int(argv[2], 0)
-            self._emit("0x%03X = 0x%02X\n" % (a, self.regs.get(a, 0)))
-        elif sub == "wr":
-            self.regs[int(argv[2], 0)] = int(argv[3], 0) & 0xFF
-        elif sub == "mode" and len(argv) == 3:
-            if argv[2] not in MODES:
-                raise CmdError("modes: ddr-a, ddr-b, sdr-a, sdr-b")
-            self.adc_mode = MODES.index(argv[2])
-        elif sub == "pat" and argv[2:] == ["off"]:
-            self.pattern = None
-        elif sub == "pat" and len(argv) == 4:
-            self.pattern = (int(argv[2], 0) & 0x3FF, int(argv[3], 0) & 0x3FF)
-        else:
-            raise CmdError("bad adc command")
-
-    def cmd_cap(self, argv):
-        words = int(argv[1]) if len(argv) == 2 else 0
-        if not 1 <= words <= 96 * 1024:
-            raise CmdError("usage: cap <1-%d words>" % (96 * 1024))
-        chan = MODES[self.adc_mode][-1]
-        n = words * 2
-        if self.pattern is not None:
-            s = np.full(n, self.pattern[0 if chan == "a" else 1], dtype=np.int64)
-        else:
-            t = np.arange(n) / FS + random.random()
-            f = 1.25e6 if chan == "a" else 2.1e6
-            s = 380 * np.sin(2 * math.pi * f * t) + 40 * np.sin(2 * math.pi * 3 * f * t + 0.3)
-            s = np.round(s + np.random.normal(0, 2.0, n)).astype(np.int64) & 0x3FF
-        data = ((s[0::2] & 0x3FF) | ((s[1::2] & 0x3FF) << 16)).astype("<u4").tobytes()
-        ms = max(1, round(n / FS * 1e3))
-        self._emit("BIN %d %s %d %08X\n" % (len(data), MODES[self.adc_mode], ms, zlib.crc32(data)))
-        self._out += data
-
-    def cmd_uart(self, argv):
-        sub = argv[1] if len(argv) > 1 else ""
-        if sub == "baud" and len(argv) == 3:
-            return
-        if sub == "tx" and len(argv) >= 3:
-            if self._powered():
-                self.uart_buf += b"> " + " ".join(argv[2:]).encode() + b"\r\n"
-            return
-        if sub == "rx" and len(argv) == 2:
-            data, self.uart_buf = bytes(self.uart_buf), bytearray()
-            self._emit("".join(chr(c) if 0x20 <= c < 0x7F and c != 0x5C else "\\x%02X" % c
-                               for c in data) + "\n")
-            return
-        raise CmdError("usage: uart baud <n> | uart tx <text> | uart rx")
-
-    def _pin(self, name):
-        for n in self.pins:
-            if n.lower() == name.lower():
-                return n
-        raise CmdError("unknown pin '%s' (pin lists them)" % name)
-
-    def _level(self, n):
-        out, lvl = self.pins[n]
-        if not out:
-            if not self._powered():
-                return False
-            if n == "CORE_GPIO":
-                return int(time.monotonic()) % 2 == 1
-        return lvl
-
-    def cmd_pin(self, argv):
-        if len(argv) == 1:
-            for n, (out, _) in self.pins.items():
-                self._emit("%-14s %s %d\n" % (n, "out" if out else "in ", self._level(n)))
-            return
-        n = self._pin(argv[1])
-        if len(argv) == 2:
-            self._emit("%d\n" % self._level(n))
-            return
-        if not self.pins[n][0]:
-            raise CmdError("%s is driven by the DUT" % n)
-        self.pins[n] = (True, argv[2] in ("1", "on"))
-
-    def cmd_pulse(self, argv):
-        n = self._pin(argv[1]) if len(argv) == 3 else None
-        if n is None or not self.pins[n][0] or not 1 <= int(argv[2]) <= 1000000:
-            raise CmdError("usage: pulse <output pin> <1-1000000 us>")
-        time.sleep(int(argv[2]) / 1e6)
-        if n == "CORE_RST" and self._powered():
-            self.uart_buf += b"\r\nSCuM-V26 sim: reset, bootloader waiting\r\n"
+    def press_button(self):
+        """The DUT reset button: counted, and CORE_RST pulsed for BUTTON_US."""
+        self._event("BUTTON")
+        us = self.reg["BUTTON_US"]
+        if us and not self.pulse_mask:
+            self.pulse_mask = 1 << PIN["CORE_RST"]
+            self.pulse_end = self._now() + us / 1e6

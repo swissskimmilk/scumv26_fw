@@ -27,7 +27,8 @@ QTabBar::tab {{ background: {WINDOW}; color: {MUTED}; border: 1px solid transpar
                padding: 6px 14px; margin-right: 2px; }}
 QTabBar::tab:selected {{ color: {TEXT}; border: 1px solid {BORDER}; border-bottom-color: {WINDOW};
                         border-top: 2px solid {ACCENT}; }}
-QTabBar::tab:hover:!selected {{ color: {TEXT}; }}
+QTabBar::tab:hover:!selected:enabled {{ color: {TEXT}; }}
+QTabBar::tab:disabled {{ color: #4d525a; }}
 QPushButton {{ background: {RAISED}; border: 1px solid {BORDER}; border-radius: 3px; padding: 4px 10px; }}
 QPushButton:hover {{ border-color: {MUTED}; }}
 QPushButton:pressed {{ background: {BASE}; }}

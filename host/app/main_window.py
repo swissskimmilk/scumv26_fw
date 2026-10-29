@@ -1,12 +1,11 @@
 """The main window: connection bar, alert banner, control column and the tabs."""
-import serial.tools.list_ports
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QMainWindow,
                                QPushButton, QScrollArea, QSplitter, QTabWidget, QToolBar,
                                QVBoxLayout, QWidget)
 
-from scum import PID, VID
+from scum import FEATURE_BLOCK, list_devices
 
 from .capture import CaptureTab
 from .control import ClockPanel, PowerPanel, StatusPanel
@@ -52,7 +51,8 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
                              spacer.sizePolicy().verticalPolicy().Preferred)
         bar.addWidget(spacer)
-        self.live = QCheckBox("Live telemetry ")
+        self.live = QCheckBox("Live update ")
+        self.live.setToolTip("Poll the rails (and the INA237s, once the gateware has I2C) every 0.5 s")
         self.live.setChecked(True)
         bar.addWidget(self.live)
         self.busy_led = Led(10)
@@ -117,6 +117,9 @@ class MainWindow(QMainWindow):
         off.triggered.connect(lambda: self.link.cmd("power down", lambda _: self.refresh_power()))
         self.addAction(off)
 
+        # Tabs and controls that need an optional gateware block (FEATURES register).
+        self.needs = {"I2C": [self.tele, self.power.vbat_row], "ADC": [self.capture], "UART": [self.uart]}
+
         # ---- link signals
         self.link.connected.connect(self.on_connected)
         self.link.disconnected.connect(self.on_disconnected)
@@ -137,14 +140,11 @@ class MainWindow(QMainWindow):
 
     def list_ports(self, prefer=None):
         self.port.clear()
-        boards, others = [], []
-        for p in serial.tools.list_ports.comports():
-            if p.vid == VID and p.pid == PID:
-                boards.append((p.device, "%s  (SCuMV26 board)" % p.device))
-            else:
-                others.append((p.device, "%s  %s" % (p.device, p.description)))
-        for dev, label in boards + others + [(SIM, "Simulator (no hardware)")]:
+        boards, err = list_devices()
+        for dev, label in boards + [(SIM, "Simulator (no hardware)")]:
             self.port.addItem(label, dev)
+        if err:
+            self.statusBar().showMessage(err + ": only the simulator is available", 15000)
         if prefer:
             i = self.port.findData(prefer)
             if i >= 0:
@@ -167,6 +167,7 @@ class MainWindow(QMainWindow):
         self.port.setEnabled(False)
         self.set_enabled(True)
         self.console.log("info", "connected: " + ident)
+        self.apply_features()
         self.refresh_settings()
         self.link.call(lambda b: b.status(peek=True), self.status_panel.update)
         self.dut.refresh()
@@ -189,21 +190,44 @@ class MainWindow(QMainWindow):
         for w in self.body:
             w.setEnabled(on)
 
+    def has(self, feature):
+        return feature in self.link.features
+
+    def apply_features(self):
+        """Grey out what this gateware cannot do yet, saying which block it needs."""
+        for feature, widgets in self.needs.items():
+            on = self.has(feature)
+            tip = "" if on else "Not in the gateware yet: needs %s" % FEATURE_BLOCK[feature]
+            for w in widgets:
+                i = self.tabs.indexOf(w)
+                if i >= 0:
+                    self.tabs.setTabEnabled(i, on)
+                    self.tabs.setTabToolTip(i, tip)
+                else:
+                    w.setEnabled(on)
+                    w.setToolTip(tip)
+        if not self.tabs.isTabEnabled(self.tabs.currentIndex()):
+            self.tabs.setCurrentWidget(self.dut)
+
     # ---- polling ------------------------------------------------------------------------
 
     def refresh_power(self):
+        i2c = self.has("I2C")
+
         def show(res):
             rails, sw, vbat = res
             self.power.set_rails(rails)
             self.power.set_switches(sw)
-            self.power.set_vbat(vbat)
+            if vbat:
+                self.power.set_vbat(vbat)
 
-        self.link.call(lambda b: (b.rails(), b.switches(), b.vbat()), show, quiet=True)
+        self.link.call(lambda b: (b.rails(), b.switches(), b.vbat() if i2c else None), show, quiet=True)
 
     def refresh_settings(self):
         """Re-read everything the board holds as settings, after a change from anywhere."""
         self.refresh_power()
-        self.link.call(lambda b: b.ilim(), self.tele.set_limits, quiet=True)
+        if self.has("I2C"):
+            self.link.call(lambda b: b.ilim(), self.tele.set_limits, quiet=True)
         self.link.call(lambda b: b.clk(), self.clock.set_clk, quiet=True)
 
     def poll(self):
@@ -214,21 +238,25 @@ class MainWindow(QMainWindow):
         if not self.live.isChecked() and not want_status:
             return
         live = self.live.isChecked()
+        tele = self.has("I2C")
         self._polling = True
 
         def work(b):
             res = {}
             if live:
-                res["tele"], res["rails"], res["sw"] = b.tele(), b.rails(), b.switches()
+                res["tele"] = b.tele() if tele else None
+                res["rails"], res["sw"] = b.rails(), b.switches()
             if want_status:
                 res["status"] = b.status(peek=True)
             return res
 
         def done(res):
             self._polling = False
-            if "tele" in res:
-                self.tele.update(res["tele"], res["rails"], res["sw"])
+            if "rails" in res:
+                if res["tele"] is not None:
+                    self.tele.update(res["tele"], res["rails"], res["sw"])
                 self.power.set_rails(res["rails"])
+                self.power.set_switches(res["sw"])
             if "status" in res:
                 self.status_panel.update(res["status"])
 

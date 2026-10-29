@@ -22,7 +22,7 @@ SW = {"vddd": "vddd", "vdda": "vdda", "rf_vdd": "rf"}
 
 
 class TelemetryTab(QWidget):
-    COLS = ("Rail", "Bus V", "Current mA", "Shunt mV", "Trip limit mA", "")
+    COLS = ("Rail", "Bus V", "Current mA", "Shunt mV", "Trip limit mA", "State")
 
     def __init__(self, link):
         super().__init__()

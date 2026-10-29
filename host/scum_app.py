@@ -2,7 +2,7 @@
 
     python scum_app.py              pick a port and press Connect
     python scum_app.py --sim        connect to the simulated board straight away
-    python scum_app.py --port COM7  connect to that port straight away
+    python scum_app.py --port FT9ABCDB   connect to that board (FT2232H channel B serial)
 """
 import argparse
 import sys
@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from app import theme
 from app.main_window import MainWindow
-from scum import Board, BoardError
+from scum import list_devices
 from app.link import SIM
 
 
@@ -22,10 +22,8 @@ def main():
     a = ap.parse_args()
     port = SIM if a.sim else a.port
     if port is None:
-        try:
-            port = Board.find_port()
-        except BoardError:
-            port = None
+        boards, _ = list_devices()
+        port = boards[0][0] if boards else None
 
     app = QApplication(sys.argv[:1])
     theme.apply(app)

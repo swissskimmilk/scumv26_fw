@@ -1,27 +1,40 @@
 """The one thread that talks to the board.
 
-The serial port is a single half-duplex conversation, so every board call goes through a
+The register link is a single half-duplex conversation, so every board call goes through a
 queue to one worker thread that owns the Board. The GUI submits a function of the board
 with `call(fn, on_done)`; the result comes back on the GUI thread through a queued signal.
 Widgets must be read on the GUI thread, before `call`, never inside fn.
-While the queue is idle the worker polls for "!" events.
+While the queue is idle the worker polls the board's event flags.
 """
 import itertools
 import queue
 import threading
 
-import serial
 from PySide6.QtCore import QObject, Signal
 
 from scum import Board, BoardError
 
 SIM = "Simulator"
+POLL_S = 0.05  # event-flag poll while idle
+
+
+def _io_errors():
+    """Exceptions that mean the USB link itself has gone (unplugged, driver error)."""
+    try:
+        import ftd2xx
+
+        return (OSError, ftd2xx.DeviceError)
+    except Exception:  # noqa: BLE001 - no D2XX library: only the simulator can be open
+        return (OSError,)
+
+
+IO_ERRORS = _io_errors()
 
 
 class Link(QObject):
-    connected = Signal(str)             # firmware id line
+    connected = Signal(str)             # gateware id line
     disconnected = Signal(str)          # reason ("" = closed by us)
-    event = Signal(str)                 # a "!" line from the board
+    event = Signal(str)                 # an event flag from the board (trip, button, framing)
     traffic = Signal(str, str, bool)    # direction (">" or "<"), line, from background polling
     error = Signal(str)                 # a call failed and had no on_error
     busy = Signal(bool)
@@ -35,6 +48,7 @@ class Link(QObject):
         self._pending = 0
         self._thread = None
         self.is_open = False
+        self.features = set()  # the gateware's optional blocks, once connected
         self._done.connect(self._finish)
 
     # ---- GUI thread -------------------------------------------------------------------
@@ -83,9 +97,9 @@ class Link(QObject):
     def _run(self, port):
         try:
             if port == SIM:
-                from sim import SimSerial
+                from sim import SimFpga
 
-                board = Board(transport=SimSerial())
+                board = Board(transport=SimFpga())
             else:
                 board = Board(port)
             board.on_event = self.event.emit
@@ -95,17 +109,18 @@ class Link(QObject):
             self._thread = None
             self.disconnected.emit(str(e))
             return
+        self.features = set(board.features)
         self.is_open = True
         self.connected.emit(ident)
         reason = ""
         while True:
             try:
-                job = self._q.get(timeout=0.05)
+                job = self._q.get(timeout=POLL_S)
             except queue.Empty:
                 try:
                     board.poll()
-                except (serial.SerialException, OSError) as e:
-                    reason = str(e)
+                except (BoardError, *IO_ERRORS) as e:
+                    reason = "lost the board: %s" % e
                     break
                 continue
             if job is None:
@@ -116,9 +131,9 @@ class Link(QObject):
                 self._done.emit(jid, fn(board), None)
             except BoardError as e:
                 self._done.emit(jid, None, e)
-            except (serial.SerialException, OSError) as e:
+            except IO_ERRORS as e:
                 self._done.emit(jid, None, e)
-                reason = str(e)
+                reason = "lost the board: %s" % e
                 break
             except Exception as e:  # noqa: BLE001 - a parse bug must not kill the link
                 self._done.emit(jid, None, e)

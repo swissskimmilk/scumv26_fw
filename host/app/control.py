@@ -3,7 +3,7 @@ import math
 
 from PySide6.QtCore import QSignalBlocker, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout)
+                               QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from .widgets import AMBER, GREY, RED, Led, big_label
 
@@ -21,7 +21,7 @@ class PowerPanel(QGroupBox):
         row = QHBoxLayout()
         self.up = QPushButton("Power up")
         self.down = QPushButton("Power down")
-        self.up.setToolTip("Sequenced: VIO, check it reached 1.6 V, VBAT, then the 1 V rails")
+        self.up.setToolTip("Sequenced: VIO, VBAT, then the 1 V rails; clears a latched trip")
         self.down.setToolTip("Reverse sequence: 1 V rails, VBAT, VIO")
         self.up.clicked.connect(lambda: self._send("power up"))
         self.down.clicked.connect(lambda: self._send("power down"))
@@ -52,6 +52,9 @@ class PowerPanel(QGroupBox):
             self.sw[key] = combo
         lay.addLayout(grid)
 
+        self.vbat_row = QWidget()  # needs the I2C block (the DAC and the VBAT monitor)
+        vl = QVBoxLayout(self.vbat_row)
+        vl.setContentsMargins(0, 0, 0, 0)
         vb = QHBoxLayout()
         self.vbat = QDoubleSpinBox()
         self.vbat.setRange(VBAT_MIN, VBAT_MAX)
@@ -68,10 +71,11 @@ class PowerPanel(QGroupBox):
         vb.addWidget(self.vbat, 1)
         vb.addWidget(set_btn)
         vb.addWidget(trim_btn)
-        lay.addLayout(vb)
+        vl.addLayout(vb)
         self.vbat_info = QLabel("")
         self.vbat_info.setStyleSheet("color:%s" % GREY)
-        lay.addWidget(self.vbat_info)
+        vl.addWidget(self.vbat_info)
+        lay.addWidget(self.vbat_row)
 
     def _send(self, line):
         self.link.cmd(line, on_done=lambda _: self.changed.emit(),
@@ -103,23 +107,19 @@ class ClockPanel(QGroupBox):
         self.sel = QComboBox()
         self.sel.addItems(["dig", "ana", "off"])
         self.sel.setToolTip("LMK1D input: dig = DUT dig_out, ana = DUT ana_out, off = outputs disabled")
-        self.psc = QComboBox()
-        self.psc.addItems(["1", "2", "4", "8"])
-        self.psc.setCurrentText("4")
-        self.psc.setToolTip("ETR prescaler: input / psc must stay under 40 MHz")
         self.win = QSpinBox()
-        self.win.setRange(1, 6000)
+        self.win.setRange(1, 40000)
+        self.win.setToolTip("Counting window; the resolution is 1 / window (10 Hz at 100 ms).\n"
+                            "The FPGA counts the DUT clock directly, to 500 MHz.")
         self.win.setValue(100)
         self.win.setSuffix(" ms")
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(self.apply)
         lay.addWidget(QLabel("Input"), 0, 0)
         lay.addWidget(self.sel, 0, 1)
-        lay.addWidget(QLabel("Prescale"), 1, 0)
-        lay.addWidget(self.psc, 1, 1)
-        lay.addWidget(QLabel("Window"), 2, 0)
-        lay.addWidget(self.win, 2, 1)
-        lay.addWidget(apply_btn, 2, 2)
+        lay.addWidget(QLabel("Window"), 1, 0)
+        lay.addWidget(self.win, 1, 1)
+        lay.addWidget(apply_btn, 1, 2)
         self.freq = big_label("--")
         lay.addWidget(self.freq, 3, 0, 1, 3)
         self.info = QLabel("")
@@ -134,19 +134,18 @@ class ClockPanel(QGroupBox):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.measure)
         self._measuring = False
-        self.psc_now, self.win_now = 4, 100  # as last reported by the board
+        self.win_now = 100  # ms, as last reported by the board
 
     def apply(self):
-        sel, psc, win = self.sel.currentText(), self.psc.currentText(), self.win.value()
-        self.link.call(lambda b: b.clk(sel=sel, psc=psc, win=win), self.set_clk)
+        sel, win = self.sel.currentText(), self.win.value()
+        self.link.call(lambda b: b.clk(sel=sel, win=win), self.set_clk)
 
     def set_clk(self, c):
-        for w, v in ((self.sel, c["sel"]), (self.psc, str(c["psc"]))):
-            with QSignalBlocker(w):
-                w.setCurrentText(v)
+        with QSignalBlocker(self.sel):
+            self.sel.setCurrentText(c["sel"])
         with QSignalBlocker(self.win):
-            self.win.setValue(c["win"])
-        self.psc_now, self.win_now = c["psc"], c["win"]
+            self.win.setValue(round(c["win"]))
+        self.win_now = c["win"]
         self.info.setText("resolution %g Hz" % c["resolution"])
 
     def measure(self):
@@ -156,8 +155,8 @@ class ClockPanel(QGroupBox):
 
         def done(hz):
             self._measuring = False
-            # Show digits down to the counter's resolution (psc / window), in MHz.
-            res_mhz = self.psc_now / self.win_now / 1e3
+            # Show digits down to the counter's resolution (1 / window), in MHz.
+            res_mhz = 1 / self.win_now / 1e3
             self.freq.setText("%.*f MHz" % (max(0, math.ceil(-math.log10(res_mhz))), hz / 1e6))
 
         def failed(e):
@@ -171,10 +170,8 @@ class ClockPanel(QGroupBox):
 class StatusPanel(QGroupBox):
     """The board's event counters. Polled with `status peek`; Clear reads and zeroes them."""
 
-    FIELDS = (("ocp_trips", "Over-current trips"), ("capture_errors", "Capture errors"),
-              ("uart_dropped", "UART bytes dropped"), ("host_dropped", "Host bytes dropped"),
-              ("button_resets", "Button resets"), ("mcu_reset", "MCU reset cause"),
-              ("uptime_s", "Uptime"))
+    FIELDS = (("ocp_trips", "Over-current trips"), ("button_resets", "Button resets"),
+              ("frame_errors", "Link framing errors"), ("uptime_s", "Uptime"))
 
     def __init__(self, link):
         super().__init__("Board status")
@@ -198,6 +195,6 @@ class StatusPanel(QGroupBox):
                 s = int(text)
                 text = "%d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60)
             lbl.setText(text)
-            bad = key not in ("mcu_reset", "uptime_s") and text.split()[0] not in ("0", "--")
+            bad = key != "uptime_s" and text.split()[0] not in ("0", "--")
             lbl.setStyleSheet("color:%s; font-weight:600" % (RED if key == "ocp_trips" else AMBER)
                               if bad else "")

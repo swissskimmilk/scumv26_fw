@@ -41,8 +41,8 @@ class CaptureTab(QWidget):
         af.addRow(row)
         self.mode = QComboBox()
         self.mode.addItems(["ddr-a", "ddr-b", "sdr-a", "sdr-b"])
-        self.mode.setToolTip("One channel per capture. ddr-*: flip the DCMI clock edge;\n"
-                             "sdr-*: the ADC outputs one channel per DCLK (needs SPI)")
+        self.mode.setToolTip("ADC output mode: ddr = both channels on both DCLK edges,\n"
+                             "sdr = one channel per DCLK (needs SPI)")
         self.mode.currentTextChanged.connect(lambda m: self.link.cmd("adc mode " + m))
         af.addRow("Mode", self.mode)
         pat = QHBoxLayout()
@@ -81,7 +81,7 @@ class CaptureTab(QWidget):
         self.words.setRange(1, CAP_MAX_WORDS)
         self.words.setValue(16384)
         self.words.setSingleStep(1024)
-        self.words.setToolTip("32-bit DCMI words; each holds two samples")
+        self.words.setToolTip("32-bit words; each holds two samples")
         cf.addRow("Words", self.words)
         cf.addRow("Sample rate", QLabel("32 MS/s (fixed 32 MHz oscillator)"))
         go = QPushButton("Capture")
