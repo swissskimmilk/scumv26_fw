@@ -7,7 +7,7 @@ set out $here/out
 file mkdir $out
 set part xc7a100tfgg676-2
 
-foreach f {scum_regs_pkg sync2 ft245_async host_bridge sys_ctrl power_ctrl clk_counter dut_io scum_top} {
+foreach f {scum_regs_pkg sync2 ft245_async host_bridge sys_ctrl power_ctrl clk_counter dut_io gpio i2c_master adc async_fifo tl_serial uart scum_top} {
     read_verilog -sv $here/rtl/$f.sv
 }
 read_xdc $here/constraints/scum_top.xdc

@@ -5,9 +5,9 @@ from PySide6.QtCore import QSignalBlocker, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from .widgets import AMBER, GREY, RED, Led, big_label
+from scum import VBAT_MAX, VBAT_MIN
 
-VBAT_MIN, VBAT_MAX = 1.164, 1.549  # buffered-DAC trim range (README, open item 7)
+from .widgets import AMBER, GREY, RED, Led, big_label
 
 
 class PowerPanel(QGroupBox):
@@ -52,6 +52,20 @@ class PowerPanel(QGroupBox):
             self.sw[key] = combo
         lay.addLayout(grid)
 
+        tr = QHBoxLayout()
+        self.trip = QCheckBox("Rails off on TELEM_ALERT")
+        self.trip.setToolTip("Hardware over-current trip: an INA237 ALERT switches every DUT rail\n"
+                             "off within 20 ns and holds them off until Power up or `trip clear`.\n"
+                             "Off at start-up. The ALERT limits are set over I2C.")
+        self.trip.clicked.connect(lambda on: self._send("trip %s" % ("on" if on else "off")))
+        self.trip_led, self.trip_info = Led(), QLabel("")
+        self.trip_info.setStyleSheet("color:%s" % GREY)
+        tr.addWidget(self.trip)
+        tr.addStretch(1)
+        tr.addWidget(self.trip_led)
+        tr.addWidget(self.trip_info)
+        lay.addLayout(tr)
+
         self.vbat_row = QWidget()  # needs the I2C block (the DAC and the VBAT monitor)
         vl = QVBoxLayout(self.vbat_row)
         vl.setContentsMargins(0, 0, 0, 0)
@@ -62,15 +76,18 @@ class PowerPanel(QGroupBox):
         self.vbat.setSingleStep(0.005)
         self.vbat.setSuffix(" V")
         self.vbat.setValue(1.384)
-        set_btn, trim_btn = QPushButton("Set"), QPushButton("Trim")
+        set_btn, trim_btn, off_btn = QPushButton("Set"), QPushButton("Trim"), QPushButton("Release")
         set_btn.setToolTip("Open loop: compute the DAC code from the resistor network")
-        trim_btn.setToolTip("Closed loop on the VBAT monitor reading, to 1 mV (VBAT must be on)")
+        trim_btn.setToolTip("Closed loop on the VBAT monitor reading, to 0.5 mV (VBAT must be on)")
+        off_btn.setToolTip("Power the DAC down (Hi-Z): VBAT goes to its divider's 1.384 V")
         set_btn.clicked.connect(lambda: self._send("vbat %.4f" % self.vbat.value()))
         trim_btn.clicked.connect(lambda: self._send("trim %.4f" % self.vbat.value()))
+        off_btn.clicked.connect(lambda: self._send("vbat off"))
         vb.addWidget(QLabel("VBAT"))
         vb.addWidget(self.vbat, 1)
         vb.addWidget(set_btn)
         vb.addWidget(trim_btn)
+        vb.addWidget(off_btn)
         vl.addLayout(vb)
         self.vbat_info = QLabel("")
         self.vbat_info.setStyleSheet("color:%s" % GREY)
@@ -95,8 +112,15 @@ class PowerPanel(QGroupBox):
             with QSignalBlocker(self.sw[k]):
                 self.sw[k].setCurrentText(v)
 
+    def set_trip(self, t):
+        with QSignalBlocker(self.trip):
+            self.trip.setChecked(t["enabled"])
+        self.trip_info.setText("TRIPPED" if t["tripped"] else "ALERT" if t["alert"] else "ALERT idle")
+        self.trip_led.set(RED if t["tripped"] else AMBER if t["alert"] else GREY)
+
     def set_vbat(self, v):
-        self.vbat_info.setText("DAC %d (%.4f V) -> set point %.4f V" % (v["dac"], v["vdac"], v["setpoint"]))
+        dac = "DAC %d (%.4f V)" % (v["dac"], v["vdac"]) if v["on"] else "DAC released"
+        self.vbat_info.setText("%s -> set point %.4f V" % (dac, v["setpoint"]))
 
 
 class ClockPanel(QGroupBox):

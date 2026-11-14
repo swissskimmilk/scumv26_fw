@@ -9,6 +9,7 @@ While the queue is idle the worker polls the board's event flags.
 import itertools
 import queue
 import threading
+from concurrent.futures import Future
 
 from PySide6.QtCore import QObject, Signal
 
@@ -79,6 +80,26 @@ class Link(QObject):
     def cmd(self, line, on_done=None, on_error=None):
         return self.call(lambda b: b.cmd(line), on_done, on_error)
 
+    # ---- any thread -------------------------------------------------------------------
+
+    def submit(self, fn):
+        """Queue fn(board) from a thread other than the GUI's; returns a Future (None while
+        closed). Its traffic is logged like a typed command."""
+        if not self.is_open:
+            return None
+        fut = Future()
+        self._q.put((fut, fn, False))
+        return fut
+
+    def _deliver(self, jid, result, exc):
+        if isinstance(jid, Future):
+            if exc is None:
+                jid.set_result(result)
+            else:
+                jid.set_exception(exc)
+        else:
+            self._done.emit(jid, result, exc)
+
     def _finish(self, jid, result, exc):
         on_done, on_error = self._callbacks.pop(jid, (None, None))
         self._pending -= 1
@@ -128,15 +149,15 @@ class Link(QObject):
             jid, fn, quiet = job
             board.quiet = quiet
             try:
-                self._done.emit(jid, fn(board), None)
+                self._deliver(jid, fn(board), None)
             except BoardError as e:
-                self._done.emit(jid, None, e)
+                self._deliver(jid, None, e)
             except IO_ERRORS as e:
-                self._done.emit(jid, None, e)
+                self._deliver(jid, None, e)
                 reason = "lost the board: %s" % e
                 break
             except Exception as e:  # noqa: BLE001 - a parse bug must not kill the link
-                self._done.emit(jid, None, e)
+                self._deliver(jid, None, e)
             finally:
                 board.quiet = False
         self.is_open = False
@@ -147,7 +168,7 @@ class Link(QObject):
             except queue.Empty:
                 break
             if job is not None:
-                self._done.emit(job[0], None, BoardError("disconnected"))
+                self._deliver(job[0], None, BoardError("disconnected"))
         try:
             board.close()
         except Exception:  # noqa: BLE001

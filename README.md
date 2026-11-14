@@ -73,6 +73,10 @@ python -m venv .venv; .venv\Scripts\pip install -r host\requirements.txt
 
 On macOS, use `.venv/bin/python` and forward slashes.
 
+While the app is connected it holds the board, so `scum.py` sends its commands through the app
+(localhost port 29563, `SCUM_APP_PORT` to change it): they appear in the app's console and its
+panels follow. With no app connected, `scum.py` opens the board itself; `--direct` forces that.
+
 ### The app
 
 The left column has three panels:
@@ -82,12 +86,20 @@ The left column has three panels:
 
 The tabs:
 
+- **Telemetry**: the six INA237 rail monitors (bus voltage, current, shunt voltage, a strip
+  chart), each rail's over-current limit, and the TLA2528's DUT analog inputs.
 - **DUT I/O**: every DUT control pin by name. Each pin can be turned between input and output,
-  driven, or pulsed for a time the FPGA measures. The *Reset DUT* and *BOOT_SEL* shortcuts are
-  here too.
+  or driven. The *Reset DUT* and *BOOT_SEL* shortcuts are here too, and the serial TileLink
+  engine: on/off, the TL_CLK rate, word reads and writes, and loading a binary into the DUT.
 - **Console**: every command and reply, plus a prompt for typing commands.
-- **Telemetry**, **ADC capture**, **DUT UART**: these are greyed out until the gateware has the
-  blocks they need. The app reads the FEATURES register to know which blocks are there.
+- **ADC capture**: ADC3910 set-up (reset and SPI check, test patterns, registers) and
+  captures of both channels at once, up to 65536 samples each: time traces of A and B, and the
+  spectrum of A, B or A + jB.
+- **DUT UART**: a terminal on the DUT's serial port: baud rate, received text (polled), and a
+  line to send.
+
+A tab or control whose gateware block is missing is greyed out; the app reads the FEATURES
+register to know which blocks are there.
 
 An over-current trip raises a red banner. Ctrl+Shift+D powers the DUT down from anywhere in the
 window.
@@ -111,10 +123,40 @@ freq                                 DUT clock frequency from the next complete 
 pin [name [0|1|in|out]]              read a pin, drive it, or turn it around
 pulse <name> <us>                    invert an output for <us> microseconds (timed in the FPGA)
 reg <addr> [value]                   raw register read or write
+tele                                 the six INA237 rail monitors: bus V, current, shunt mV
+ilim [rail mA]                       INA237 over-current limit per rail (0 = off)
+aux                                  the TLA2528's eight DUT analog inputs, volts
+vbat [V | off]                       VBAT set point through the DAC (open loop), or released
+trim <V>                             VBAT to <V> closed loop on its INA237 (VBAT must be on)
+i2c scan | recover                   list responding addresses / free a stuck bus
+i2c <addr> [w b0 b1 ..] [r n] [sep]  raw transaction (hex bytes, up to 4 each way)
+adc                                  ADC3910: DCLK rate, capture state
+adc init                             hardware reset, wait out its calibration, check SPI
+adc rd <addr> | wr <addr> <val>      ADC3910 register (hex)
+adc pat <a> <b> | pat off            constant test codes on channels A and B (10-bit, hex)
+cap [pairs]                          capture both channels and print per-channel statistics
+tl                                   serial TileLink: TL_CLK rate, engine state, FIFOs
+tl on | off                          the engine takes over / releases the TileLink pins
+tl rd <addr> [n]                     n 32-bit words from the DUT's address space (hex)
+tl wr <addr> <word> [word ..]        write 32-bit words (hex), each a PutFullData
+tl load <file> <addr>                write a binary file into the DUT's memory, then verify it
+uart                                 DUT UART: baud, bytes waiting, errors
+uart baud <n>                        8N1 at n baud (default 115200)
+uart tx <text>                       send text and CR LF
+uart rx                              what the DUT has sent since the last read
 ```
 
-`tele`, `ilim`, `aux`, `vbat`, `adc`, `cap` and `uart` answer `ERR not in the gateware yet` until
-their blocks are built.
+From Python, `Board.capture(n)` returns the raw capture words and `scum.unpack(raw)` splits them
+into the two channels' signed samples. `Board.tl_read`, `tl_write` and `tl_load` take any
+access size; `Board.tl_xfer` sends raw TileLink messages and returns the answers.
+
+The telemetry devices are driven from Python, one I2C transaction per register access:
+
+| Device | Address | What |
+|---|---|---|
+| INA237 U13, U15, U17, U18, U14, U16 | 0x40, 0x41, 0x43, 0x44, 0x45, 0x4C | VIO (2 R), VBAT (0.82 R), VDDD (1.6 R), VDDA (5.6 R), VBAT_RF (1.6 R), RF_VDD (1.6 R) |
+| TLA2528 U20 | 0x10 | AIN0-7: VNFC, spare 3, spare 4, PWR_I_REF, VIO, PWR_VDD_RF, spare 1, spare 2 (3.3 V reference) |
+| DAC53401 U28 | 0x48 | VBAT trim: 1.110 V (code 1023) to 1.604 V (code 0); released (Hi-Z, the power-on state) leaves 1.384 V |
 
 ### From Python
 
@@ -158,14 +200,27 @@ Vivado does not fit on a hosted runner, so the bitstream is built locally. Attac
 
 ## Status and open items
 
-- **Nothing has run on hardware yet.** The gateware passes its testbench (44 checks) and meets
+- **Nothing has run on hardware yet.** The gateware passes its testbench (125 checks) and meets
   timing; the host passes its tests against the simulator.
-- **Gateware blocks still to build:**
-  - the I2C master for the INA237 monitors, the TLA2528 and the VBAT DAC;
-  - ADC3910 capture and its SPI;
-  - the DUT UART;
-  - TileLink and scan-chain engines. Their pins are plain DUT GPIO for now.
+- **Gateware still to build: the scan-chain engine.** Its pins are plain DUT GPIO for now. It
+  waits on the SCuM-V26 scan-chain spec: SCuM-V24B's chain had no SCAN_OUT or SCAN_SEL.
+- **Serial TileLink follows SCuM-V24B's frame,** from the public bring-up repo
+  (ucb-ee290c/scum-v-bringup, `GenericSerializer.sv`): 164 bits, LSB first,
+  {chanId, opcode, param, size, source, address[64], data[64], corrupt, union[9], last}. To
+  confirm on V26:
+  - the field layout (`TL_FIELDS` in `scum.py`; the FPGA only needs TL_FRAME);
+  - the byte lanes: data and mask follow `address % 8` (`TL_BEAT`), where V24B's own host sent
+    mask 0xFF with the data unshifted;
+  - how many requests may be in flight (`TL_WINDOW`, 1 for now: one round trip per word).
+- **TL_CLK comes from the DUT.** The FPGA no longer drives it at reset. The engine samples and
+  drives on TL_CLK's falling edges, half a period from the DUT's rising edges.
 - **CORE_RST polarity is unconfirmed.** The pin idles high, matching the fitted pull-up, and
   pulses invert whatever level it is at.
-- **The over-current trip** acts on the INA237s' shared ALERT line, so it only means something
-  once the I2C block programs their limits. Enable it with `trip on` after that.
+- **The over-current trip** acts on the INA237s' shared ALERT line. It is off at start-up: set
+  the limits (`ilim`, or the Telemetry tab), then turn it on with `trip on` or the *Rails off on
+  TELEM_ALERT* box. The INA237s latch their alerts, so a trip names the rail that caused it.
+- **The ADC3910 runs in its power-on default** (10-bit DDR, two's complement); the gateware
+  does not configure it. The test-pattern codes are written to the top 10 of the ADC's 14-bit
+  pattern registers, which is an assumption to confirm on the board (`adc pat`, then `cap`).
+- **The VBAT set point is open loop** on SYS_1V8 as the DAC's reference; `trim` closes the loop on
+  the VBAT monitor.

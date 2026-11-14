@@ -1,9 +1,13 @@
-// DUT power (block 0x01): regulator enables, rail-source switches, and the over-current trip.
+// DUT power (block 0x01): regulator enables, rail-source switches, the over-current trip, and
+// the regulators' power-good pins.
 //
 // The trip is pure hardware, with no software in the path: TELEM_ALERT (the six INA237s' shared open-drain ALERT) drops all three
 // enables two clock edges after it reaches the pin, and TRIP_STATUS.TRIPPED then holds them off
 // until the host clears it. Sequencing (VIO -> VBAT -> 1 V, with settling delays and monitor
 // checks) stays on the PC: it is slow and needs the INA237 readings.
+//
+// RAIL_PG reads the eight PG pins (synchronised). vio_good = VIO_EN and REG_VIO_PG both set:
+// the DUT pads stay released until the VIO regulator reports its output in regulation.
 module power_ctrl
     import scum_regs_pkg::*;
 (
@@ -16,6 +20,7 @@ module power_ctrl
     output logic [31:0] rdata,
     // pins
     input  logic        alert_pin,
+    input  logic  [7:0] pg_pins,   // RAIL_PG bit order
     output logic        vio_en,
     output logic        vbat_en,
     output logic        vdd_en,
@@ -24,14 +29,17 @@ module power_ctrl
     output logic        rf_sw,
     // status
     output logic        trip_evt,  // one-cycle pulse when a trip drops the rails
-    output logic        dut_powered
+    output logic        dut_powered,
+    output logic        vio_good
 );
     logic [2:0] en, sw;
     logic       trip_en, active_high, tripped, alert_s;
+    logic [7:0] pg;
     wire sel = bus_addr[15:8] == A_RAIL_EN[15:8];
     wire alert = alert_s ^ ~active_high;  // 1 = asserted
 
     sync2 #(.INIT(1'b1)) u_alert (.clk, .d(alert_pin), .q(alert_s));
+    sync2 #(.W(8)) u_pg (.clk, .d(pg_pins), .q(pg));
 
     always_ff @(posedge clk) begin
         trip_evt <= 1'b0;
@@ -59,6 +67,7 @@ module power_ctrl
     assign {vdd_en, vbat_en, vio_en} = en;
     assign {rf_sw, vdda_sw, vddd_sw} = sw;
     assign dut_powered = |en;
+    assign vio_good = vio_en && pg[RAIL_PG_VIO];
 
     always_ff @(posedge clk) begin
         rdata <= '0;
@@ -68,6 +77,7 @@ module power_ctrl
                 A_RAIL_SW:     rdata <= {29'b0, sw};
                 A_TRIP_CTRL:   rdata <= {30'b0, active_high, trip_en};
                 A_TRIP_STATUS: rdata <= {30'b0, alert, tripped};
+                A_RAIL_PG:     rdata <= {24'b0, pg};
                 default:       rdata <= '0;
             endcase
     end

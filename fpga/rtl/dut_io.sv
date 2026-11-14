@@ -2,8 +2,9 @@
 // DUT reset button.
 //
 // Every pad is bidirectional and the host chooses the direction (DUT_OE); the reset values
-// come from regmap.DUT_PINS. While RAIL_EN.VIO is off every pad is released, so the
-// FPGA never back-powers the DUT through its I/O ring.
+// come from regmap.DUT_PINS. Until RAIL_EN.VIO is on AND the VIO regulator reports power good
+// every pad is released, so the FPGA never back-powers the DUT through its I/O ring, nor
+// drives it while VIO is still ramping.
 //
 // A pulse inverts one output for DUT_PULSE.US microseconds and then restores it, so it works
 // whichever way the pin idles (CORE_RST's polarity is still unconfirmed). The button
@@ -20,7 +21,7 @@ module dut_io
     input  logic             bus_rd,
     output logic [31:0]      rdata,
     input  logic             tick_ms,
-    input  logic             vio_on,
+    input  logic             vio_on,   // VIO_EN and REG_VIO_PG
     // pads
     output logic [N_DUT-1:0] pad_out,
     output logic [N_DUT-1:0] pad_oe,

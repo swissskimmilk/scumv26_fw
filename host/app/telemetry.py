@@ -60,7 +60,7 @@ class TelemetryTab(QWidget):
             spin.setDecimals(2)
             spin.setSpecialValueText("off")
             spin.setToolTip("Hardware over-current trip on this rail's INA237 (0 = off).\n"
-                            "Any trip drops every DUT rail within ~2 ms.")
+                            "With the trip on, any ALERT drops every DUT rail within 20 ns.")
             spin.editingFinished.connect(lambda r=rail, s=spin: self._set_limit(r, s.value()))
             self.table.setCellWidget(r, 4, spin)
             self.limits[rail] = spin

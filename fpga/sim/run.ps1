@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force $work | Out-Null
 Push-Location $work
 try {
     $src = @("scum_regs_pkg.sv", "sync2.sv", "ft245_async.sv", "host_bridge.sv", "sys_ctrl.sv",
-             "power_ctrl.sv", "clk_counter.sv", "dut_io.sv", "scum_top.sv") | ForEach-Object { Join-Path $rtl $_ }
+             "power_ctrl.sv", "clk_counter.sv", "dut_io.sv", "gpio.sv", "i2c_master.sv", "adc.sv", "async_fifo.sv", "tl_serial.sv", "uart.sv", "scum_top.sv") | ForEach-Object { Join-Path $rtl $_ }
     & "$vivado\bin\xvlog.bat" --sv @src (Join-Path $here "tb_scum_top.sv") "$vivado\data\verilog\src\glbl.v"
     if ($LASTEXITCODE) { throw "xvlog failed" }
     & "$vivado\bin\xelab.bat" -L unisims_ver tb_scum_top glbl -s tb -timescale 1ns/1ps

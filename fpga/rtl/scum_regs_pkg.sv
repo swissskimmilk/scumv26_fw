@@ -2,10 +2,16 @@
 package scum_regs_pkg;
 
   localparam int unsigned SYS_HZ = 100000000;
+  localparam int unsigned I2C_TIMEOUT = 1000000;
+  localparam int unsigned ADC_SPI_HALF = 10;
+  localparam int unsigned CAP_DEPTH = 65536;
+  localparam int unsigned TL_FIFO = 512;
+  localparam int unsigned UART_RX_FIFO = 2048;
+  localparam int unsigned UART_TX_FIFO = 512;
   localparam logic [31:0] ID_MAGIC = 32'h5343554D;
-  localparam logic [31:0] VERSION = 32'h00010000;
+  localparam logic [31:0] VERSION = 32'h00050000;
   localparam int unsigned N_DUT = 21;
-  localparam logic [N_DUT-1:0] DUT_OE_RESET = 21'h3DFB;
+  localparam logic [N_DUT-1:0] DUT_OE_RESET = 21'h39FB;
   localparam logic [N_DUT-1:0] DUT_OUT_RESET = 21'h1;
 
   localparam int unsigned PIN_CORE_RST = 0;
@@ -33,7 +39,7 @@ package scum_regs_pkg;
   localparam logic [15:0] A_ID = 16'h0000;  // ro: constant 0x5343554D ("SCUM")
   localparam logic [31:0] R_ID = 32'h5343554D;
   localparam logic [15:0] A_VERSION = 16'h0004;  // ro: gateware version, major[31:24] minor[23:16] patch[15:0]
-  localparam logic [31:0] R_VERSION = 32'h00010000;
+  localparam logic [31:0] R_VERSION = 32'h00050000;
   localparam logic [15:0] A_SCRATCH = 16'h0008;  // rw: free for the host; a link test
   localparam logic [31:0] R_SCRATCH = 32'h00000000;
   localparam logic [15:0] A_UPTIME_MS = 16'h000C;  // ro: milliseconds since configuration (wraps after 49 days)
@@ -50,10 +56,11 @@ package scum_regs_pkg;
   localparam logic [15:0] A_FRAME_COUNT = 16'h001C;  // ro: host framing errors since configuration
   localparam logic [31:0] R_FRAME_COUNT = 32'h00000000;
   localparam logic [15:0] A_FEATURES = 16'h0020;  // ro: blocks built into this gateware; the host greys out the rest
-  localparam logic [31:0] R_FEATURES = 32'h00000000;
+  localparam logic [31:0] R_FEATURES = 32'h0000000F;
   localparam int unsigned FEATURES_I2C = 0;
   localparam int unsigned FEATURES_ADC = 1;
   localparam int unsigned FEATURES_UART = 2;
+  localparam int unsigned FEATURES_TL = 3;
   localparam logic [15:0] A_RAIL_EN = 16'h0100;  // rw: DUT regulator enables; writes are ignored while TRIP_STATUS.TRIPPED
   localparam logic [31:0] R_RAIL_EN = 32'h00000000;
   localparam int unsigned RAIL_EN_VIO = 0;
@@ -72,6 +79,16 @@ package scum_regs_pkg;
   localparam logic [31:0] R_TRIP_STATUS = 32'h00000000;
   localparam int unsigned TRIP_STATUS_TRIPPED = 0;
   localparam int unsigned TRIP_STATUS_ALERT = 1;
+  localparam logic [15:0] A_RAIL_PG = 16'h0110;  // ro: regulator power-good pins (open drain, 100k to SYS_1V8; 1 = good)
+  localparam logic [31:0] R_RAIL_PG = 32'h00000000;
+  localparam int unsigned RAIL_PG_VIO = 0;
+  localparam int unsigned RAIL_PG_VBAT = 1;
+  localparam int unsigned RAIL_PG_VDDD = 2;
+  localparam int unsigned RAIL_PG_VDDA = 3;
+  localparam int unsigned RAIL_PG_RF = 4;
+  localparam int unsigned RAIL_PG_SYS_1V8 = 5;
+  localparam int unsigned RAIL_PG_SYS_3V3 = 6;
+  localparam int unsigned RAIL_PG_FPGA_1V8 = 7;
   localparam logic [15:0] A_CLK_CTRL = 16'h0200;  // rw: LMK1D1204 input select; writing restarts the count
   localparam logic [31:0] R_CLK_CTRL = 32'h00000000;
   localparam int unsigned CLK_CTRL_SEL = 0;  // width 2
@@ -82,7 +99,7 @@ package scum_regs_pkg;
   localparam logic [15:0] A_CLK_SEQ = 16'h020C;  // ro: windows completed since the last restart
   localparam logic [31:0] R_CLK_SEQ = 32'h00000000;
   localparam logic [15:0] A_DUT_OE = 16'h0300;  // rw: 1 = the FPGA drives the pin; every pad is released while RAIL_EN.VIO is off
-  localparam logic [31:0] R_DUT_OE = 32'h00003DFB;
+  localparam logic [31:0] R_DUT_OE = 32'h000039FB;
   localparam logic [15:0] A_DUT_OUT = 16'h0304;  // rw: levels driven where DUT_OE is set
   localparam logic [31:0] R_DUT_OUT = 32'h00000001;
   localparam logic [15:0] A_DUT_IN = 16'h0308;  // ro: pad levels (synchronised; reads the driven level on outputs)
@@ -94,6 +111,95 @@ package scum_regs_pkg;
   localparam int unsigned DUT_PULSE_BUSY = 31;
   localparam logic [15:0] A_BUTTON_US = 16'h0310;  // rw: CORE_RST pulse width for the reset button, us; 0 = button only counted
   localparam logic [31:0] R_BUTTON_US = 32'h000003E8;
+  localparam logic [15:0] A_GPIO_OE = 16'h0400;  // rw: FPGA_GPIO[5:0] on J16: 1 = the FPGA drives the pin
+  localparam logic [31:0] R_GPIO_OE = 32'h00000000;
+  localparam logic [15:0] A_GPIO_OUT = 16'h0404;  // rw: levels driven where GPIO_OE is set
+  localparam logic [31:0] R_GPIO_OUT = 32'h00000000;
+  localparam logic [15:0] A_GPIO_IN = 16'h0408;  // ro: pin levels (synchronised)
+  localparam logic [31:0] R_GPIO_IN = 32'h00000000;
+  localparam logic [15:0] A_I2C_DIV = 16'h0500;  // rw: SCL quarter period in system clocks (250 = 100 kHz, 63 = 397 kHz; at least 4)
+  localparam logic [31:0] R_I2C_DIV = 32'h000000FA;
+  localparam logic [15:0] A_I2C_CMD = 16'h0504;  // rw: write to run one transaction (ignored while busy): START, address+W, WLEN bytes of I2C_WDATA, then if RLEN a repeated START (STOP + START with SEP), address+R, RLEN bytes into I2C_RDATA, STOP. WLEN = RLEN = 0 sends the address alone (a probe)
+  localparam logic [31:0] R_I2C_CMD = 32'h00000000;
+  localparam int unsigned I2C_CMD_ADDR = 0;  // width 7
+  localparam int unsigned I2C_CMD_WLEN = 8;  // width 3
+  localparam int unsigned I2C_CMD_RLEN = 12;  // width 3
+  localparam int unsigned I2C_CMD_SEP = 16;
+  localparam int unsigned I2C_CMD_RECOVER = 24;
+  localparam logic [15:0] A_I2C_WDATA = 16'h0508;  // rw: bytes to write; byte 0 ([7:0]) goes first
+  localparam logic [31:0] R_I2C_WDATA = 32'h00000000;
+  localparam logic [15:0] A_I2C_RDATA = 16'h050C;  // ro: bytes read by the last transaction; byte 0 ([7:0]) came first
+  localparam logic [31:0] R_I2C_RDATA = 32'h00000000;
+  localparam logic [15:0] A_I2C_STATUS = 16'h0510;  // ro: transaction state; the flags clear when the next one starts
+  localparam logic [31:0] R_I2C_STATUS = 32'h00000000;
+  localparam int unsigned I2C_STATUS_BUSY = 0;
+  localparam int unsigned I2C_STATUS_ANACK = 1;
+  localparam int unsigned I2C_STATUS_DNACK = 2;
+  localparam int unsigned I2C_STATUS_TIMEOUT = 3;
+  localparam int unsigned I2C_STATUS_STUCK = 4;
+  localparam int unsigned I2C_STATUS_SCL = 8;
+  localparam int unsigned I2C_STATUS_SDA = 9;
+  localparam logic [15:0] A_ADC_CTRL = 16'h0600;  // rw: ADC3910 control pins
+  localparam logic [31:0] R_ADC_CTRL = 32'h00000000;
+  localparam int unsigned ADC_CTRL_RESET = 0;
+  localparam logic [15:0] A_ADC_SPI = 16'h0604;  // rw: write to send one 24-bit SPI frame (ignored while busy); SCLK is SYS_HZ / (2 * ADC_SPI_HALF)
+  localparam logic [31:0] R_ADC_SPI = 32'h00000000;
+  localparam int unsigned ADC_SPI_DATA = 0;  // width 8
+  localparam int unsigned ADC_SPI_ADDR = 8;  // width 15
+  localparam int unsigned ADC_SPI_READ = 23;
+  localparam logic [15:0] A_ADC_SPI_STATUS = 16'h0608;  // ro: SPI state
+  localparam logic [31:0] R_ADC_SPI_STATUS = 32'h00000000;
+  localparam int unsigned ADC_SPI_STATUS_BUSY = 0;
+  localparam int unsigned ADC_SPI_STATUS_RDATA = 8;  // width 8
+  localparam logic [15:0] A_ADC_DCLK_KHZ = 16'h060C;  // ro: ADC DCLK cycles in the last millisecond (0 = no DCLK)
+  localparam logic [31:0] R_ADC_DCLK_KHZ = 32'h00000000;
+  localparam logic [15:0] A_CAP_LEN = 16'h0610;  // rw: sample pairs per capture, 1-65536
+  localparam logic [31:0] R_CAP_LEN = 32'h00001000;
+  localparam logic [15:0] A_CAP_CTRL = 16'h0614;  // rw: capture control
+  localparam logic [31:0] R_CAP_CTRL = 32'h00000000;
+  localparam int unsigned CAP_CTRL_START = 0;
+  localparam logic [15:0] A_CAP_STATUS = 16'h0618;  // ro: capture state
+  localparam logic [31:0] R_CAP_STATUS = 32'h00000000;
+  localparam int unsigned CAP_STATUS_BUSY = 0;
+  localparam int unsigned CAP_STATUS_DONE = 1;
+  localparam logic [15:0] A_CAP_ADDR = 16'h061C;  // rw: the buffer word CAP_DATA reads next
+  localparam logic [31:0] R_CAP_ADDR = 32'h00000000;
+  localparam logic [15:0] A_CAP_DATA = 16'h0620;  // ro: one sample pair from the buffer, then CAP_ADDR + 1 (read it with a burst)
+  localparam logic [31:0] R_CAP_DATA = 32'h00000000;
+  localparam int unsigned CAP_DATA_A = 0;  // width 10
+  localparam int unsigned CAP_DATA_B = 16;  // width 10
+  localparam logic [15:0] A_TL_CTRL = 16'h0700;  // rw: serial TileLink engine
+  localparam logic [31:0] R_TL_CTRL = 32'h00000000;
+  localparam int unsigned TL_CTRL_EN = 0;
+  localparam logic [15:0] A_TL_FRAME = 16'h0704;  // rw: frame length in bits, 1-256, both ways; change it only while TL_CTRL.EN is off
+  localparam logic [31:0] R_TL_FRAME = 32'h000000A4;
+  localparam logic [15:0] A_TL_TX = 16'h0708;  // wo: queue one 32-bit word of an outgoing frame (word 0 first; each word LSB first; the bits past the frame length in its last word are dropped). Dropped when full
+  localparam logic [31:0] R_TL_TX = 32'h00000000;
+  localparam logic [15:0] A_TL_RX = 16'h070C;  // ro: the next word of the incoming frames, packed the same way (0 when empty; read TL_STATUS.RX_WORDS of them with a burst)
+  localparam logic [31:0] R_TL_RX = 32'h00000000;
+  localparam logic [15:0] A_TL_STATUS = 16'h0710;  // ro: FIFO state
+  localparam logic [31:0] R_TL_STATUS = 32'h00000000;
+  localparam int unsigned TL_STATUS_RX_WORDS = 0;  // width 12
+  localparam int unsigned TL_STATUS_TX_FREE = 16;  // width 12
+  localparam int unsigned TL_STATUS_TX_BUSY = 31;
+  localparam logic [15:0] A_TL_CLK_KHZ = 16'h0714;  // ro: TL_CLK cycles in the last millisecond (0 = the DUT is not clocking the link)
+  localparam logic [31:0] R_TL_CLK_KHZ = 32'h00000000;
+  localparam logic [15:0] A_UART_DIV = 16'h0800;  // rw: system clocks per bit, 16-65535 (868 = 115200 baud); 8N1 both ways
+  localparam logic [31:0] R_UART_DIV = 32'h00000364;
+  localparam logic [15:0] A_UART_TX = 16'h0804;  // wo: queue one byte ([7:0]) for FPGA_UART_TX; dropped when full
+  localparam logic [31:0] R_UART_TX = 32'h00000000;
+  localparam logic [15:0] A_UART_RX = 16'h0808;  // ro: the next byte from FPGA_UART_RX (read them with a burst)
+  localparam logic [31:0] R_UART_RX = 32'h00000000;
+  localparam int unsigned UART_RX_DATA = 0;  // width 8
+  localparam int unsigned UART_RX_VALID = 8;
+  localparam logic [15:0] A_UART_STATUS = 16'h080C;  // ro: FIFO state
+  localparam logic [31:0] R_UART_STATUS = 32'h00000000;
+  localparam int unsigned UART_STATUS_RX_COUNT = 0;  // width 12
+  localparam int unsigned UART_STATUS_TX_COUNT = 16;  // width 12
+  localparam logic [15:0] A_UART_EVENTS = 16'h0810;  // w1c: sticky receive errors
+  localparam logic [31:0] R_UART_EVENTS = 32'h00000000;
+  localparam int unsigned UART_EVENTS_OVERRUN = 0;
+  localparam int unsigned UART_EVENTS_FRAMING = 1;
 
   localparam logic [7:0] CMD_WRITE = 8'h57;
   localparam logic [7:0] CMD_READ = 8'h52;

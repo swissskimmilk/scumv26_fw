@@ -11,6 +11,7 @@ from .capture import CaptureTab
 from .control import ClockPanel, PowerPanel, StatusPanel
 from .dut_io import DutIoTab
 from .link import SIM, Link
+from .share import Share
 from .telemetry import TelemetryTab
 from .terminal import ConsoleTab, UartTab
 from .widgets import AMBER, GREEN, GREY, RED, Led
@@ -52,7 +53,7 @@ class MainWindow(QMainWindow):
                              spacer.sizePolicy().verticalPolicy().Preferred)
         bar.addWidget(spacer)
         self.live = QCheckBox("Live update ")
-        self.live.setToolTip("Poll the rails (and the INA237s, once the gateware has I2C) every 0.5 s")
+        self.live.setToolTip("Poll the rails and the INA237 rail monitors every 0.5 s")
         self.live.setChecked(True)
         bar.addWidget(self.live)
         self.busy_led = Led(10)
@@ -110,6 +111,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.body = (scroll, self.tabs)
         self.console.ran.connect(self.refresh_settings)
+        self.share = Share(self.link)  # scum.py's commands run through this window's link
+        self.share.ran.connect(self.refresh_settings)
 
         # ---- shortcuts
         off = QAction("Power down", self)
@@ -118,7 +121,8 @@ class MainWindow(QMainWindow):
         self.addAction(off)
 
         # Tabs and controls that need an optional gateware block (FEATURES register).
-        self.needs = {"I2C": [self.tele, self.power.vbat_row], "ADC": [self.capture], "UART": [self.uart]}
+        self.needs = {"I2C": [self.tele, self.power.vbat_row], "ADC": [self.capture], "UART": [self.uart],
+                      "TL": [self.dut.tl_box]}
 
         # ---- link signals
         self.link.connected.connect(self.on_connected)
@@ -167,6 +171,8 @@ class MainWindow(QMainWindow):
         self.port.setEnabled(False)
         self.set_enabled(True)
         self.console.log("info", "connected: " + ident)
+        err = self.share.start()
+        self.console.log("err" if err else "info", err or "scum.py commands run through this window")
         self.apply_features()
         self.refresh_settings()
         self.link.call(lambda b: b.status(peek=True), self.status_panel.update)
@@ -174,6 +180,7 @@ class MainWindow(QMainWindow):
         self.timer.start(POLL_MS)
 
     def on_disconnected(self, reason):
+        self.share.stop()  # the board is free again: scum.py opens it itself
         self.timer.stop()
         self._polling = False
         self.link_led.set(RED if reason else GREY)
@@ -215,13 +222,15 @@ class MainWindow(QMainWindow):
         i2c = self.has("I2C")
 
         def show(res):
-            rails, sw, vbat = res
+            rails, sw, trip, vbat = res
             self.power.set_rails(rails)
             self.power.set_switches(sw)
+            self.power.set_trip(trip)
             if vbat:
                 self.power.set_vbat(vbat)
 
-        self.link.call(lambda b: (b.rails(), b.switches(), b.vbat() if i2c else None), show, quiet=True)
+        self.link.call(lambda b: (b.rails(), b.switches(), b.trip_state(), b.vbat() if i2c else None),
+                       show, quiet=True)
 
     def refresh_settings(self):
         """Re-read everything the board holds as settings, after a change from anywhere."""
@@ -248,6 +257,7 @@ class MainWindow(QMainWindow):
                 res["rails"], res["sw"] = b.rails(), b.switches()
             if want_status:
                 res["status"] = b.status(peek=True)
+                res["trip"] = b.trip_state()
             return res
 
         def done(res):
@@ -259,6 +269,7 @@ class MainWindow(QMainWindow):
                 self.power.set_switches(res["sw"])
             if "status" in res:
                 self.status_panel.update(res["status"])
+                self.power.set_trip(res["trip"])
 
         def failed(e):
             self._polling = False
@@ -290,5 +301,6 @@ class MainWindow(QMainWindow):
             self.console.log(direction, text)
 
     def closeEvent(self, e):
+        self.share.stop()
         self.link.close()
         super().closeEvent(e)

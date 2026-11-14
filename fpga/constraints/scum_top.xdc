@@ -1,6 +1,8 @@
 # SCuMV26 bring-up board, XC7A100T-2FGG676I.
 # Pins extracted from the Altium project (SCuM_CPGA_Breakout_FPGA, FPGA.SchDoc) on 2026-10-29.
 # Banks 14/15 (FT2232H, flash, 100 MHz clock) are 3.3 V; 13 (DUT), 16 (ADC), 34 and 35 are 1.8 V.
+# CLK_BUF_1 is LVDS_25 in 1.8 V bank 34: legal for an input only with the internal terminator
+# off (UG471), so its IBUFDS sets DIFF_TERM FALSE; R85 terminates on the board.
 
 set_property -dict {PACKAGE_PIN U20 IOSTANDARD LVCMOS18} [get_ports {BASEBAND_RX}]  ;# IO_L15N_T2_DQS_13
 set_property -dict {PACKAGE_PIN T20 IOSTANDARD LVCMOS18} [get_ports {BASEBAND_TX}]  ;# IO_L15P_T2_DQS_13
@@ -71,9 +73,27 @@ set_property -dict {PACKAGE_PIN K5 IOSTANDARD LVCMOS18} [get_ports {VDDA_SW}]  ;
 set_property -dict {PACKAGE_PIN L5 IOSTANDARD LVCMOS18} [get_ports {VDDD_SW}]  ;# IO_L4P_T0_34
 set_property -dict {PACKAGE_PIN M4 IOSTANDARD LVCMOS18} [get_ports {VDD_EN}]  ;# IO_L3P_T0_DQS_34
 set_property -dict {PACKAGE_PIN L4 IOSTANDARD LVCMOS18} [get_ports {VIO_EN}]  ;# IO_L3N_T0_DQS_34
+# Regulator power-good, open drain with 100k to SYS_1V8 (added to the schematic 2026-11-06).
+set_property -dict {PACKAGE_PIN K2 IOSTANDARD LVCMOS18} [get_ports {REG_VIO_PG}]  ;# IO_L8N_T1_34
+set_property -dict {PACKAGE_PIN L3 IOSTANDARD LVCMOS18} [get_ports {REG_VBAT_PG}]  ;# IO_L8P_T1_34
+set_property -dict {PACKAGE_PIN J1 IOSTANDARD LVCMOS18} [get_ports {REG_VDDD_PG}]  ;# IO_L7N_T1_34
+set_property -dict {PACKAGE_PIN H2 IOSTANDARD LVCMOS18} [get_ports {REG_VDDA_PG}]  ;# IO_L10P_T1_34
+set_property -dict {PACKAGE_PIN H1 IOSTANDARD LVCMOS18} [get_ports {REG_RF_VDD_PG}]  ;# IO_L10N_T1_34
+set_property -dict {PACKAGE_PIN N1 IOSTANDARD LVCMOS18} [get_ports {REG_SYS_1V8_PG}]  ;# IO_L9P_T1_DQS_34
+set_property -dict {PACKAGE_PIN M1 IOSTANDARD LVCMOS18} [get_ports {REG_SYS_3V3_PG}]  ;# IO_L9N_T1_DQS_34
+set_property -dict {PACKAGE_PIN N8 IOSTANDARD LVCMOS18} [get_ports {REG_FPGA_1V8_PG}]  ;# IO_0_34
+# J16 header spares, bank 35 (GPIO3-5 added 2026-11-06 on J16 pins 2/4/6)
+set_property -dict {PACKAGE_PIN E6 IOSTANDARD LVCMOS18} [get_ports {FPGA_GPIO[0]}]  ;# IO_L1P_T0_AD4P_35
+set_property -dict {PACKAGE_PIN D6 IOSTANDARD LVCMOS18} [get_ports {FPGA_GPIO[1]}]  ;# IO_L1N_T0_AD4N_35
+set_property -dict {PACKAGE_PIN H8 IOSTANDARD LVCMOS18} [get_ports {FPGA_GPIO[2]}]  ;# IO_L2P_T0_AD12P_35
+set_property -dict {PACKAGE_PIN G8 IOSTANDARD LVCMOS18} [get_ports {FPGA_GPIO[3]}]  ;# IO_L2N_T0_AD12N_35
+set_property -dict {PACKAGE_PIN H7 IOSTANDARD LVCMOS18} [get_ports {FPGA_GPIO[4]}]  ;# IO_L3P_T0_DQS_AD5P_35
+set_property -dict {PACKAGE_PIN G7 IOSTANDARD LVCMOS18} [get_ports {FPGA_GPIO[5]}]  ;# IO_L3N_T0_DQS_AD5N_35
 
 # FT2232H RD#/WR# idle high through configuration as well
 set_property PULLUP TRUE [get_ports {FT_RD_N FT_WR_N}]
+# Header pins float when nothing is plugged in; keep the GPIO_IN reads defined.
+set_property PULLDOWN TRUE [get_ports {FPGA_GPIO[*]}]
 
 set_property CFGBVS VCCO [current_design]
 set_property CONFIG_VOLTAGE 3.3 [current_design]
@@ -85,12 +105,38 @@ create_clock -period 10.000 -name sys_clk [get_ports CLK_100M]
 # The DUT clock's rate is whatever the DUT makes; constrain the counter for the fastest we
 # expect to count (500 MHz) so the 32-bit increment is checked at that rate.
 create_clock -period 2.000 -name dut_clk [get_ports CLK_BUF_1_P]
-set_clock_groups -asynchronous -group sys_clk -group dut_clk
+# ADC3910 DCLK: the 32 MHz sample clock (Y2), DDR data centred on both edges.
+create_clock -period 31.250 -name adc_dclk [get_ports ADC_DCLK]
+# Serial TileLink clock from the DUT. Its rate is the DUT's choice; constrain for 50 MHz, well
+# above what a bring-up link runs at. The engine works on its falling edges (half periods).
+create_clock -period 20.000 -name tl_clk [get_ports TL_CLK]
+set_clock_groups -asynchronous -group sys_clk -group dut_clk -group adc_dclk -group tl_clk
 # Gray-coded counter crossing: bound the skew between its bits to one DUT clock period.
 set_max_delay -datapath_only 2.000 -from [get_cells -hier -filter {NAME =~ *u_clk/gray_reg*}] \
     -to [get_cells -hier -filter {NAME =~ *u_clk/g0_reg*}]
 
+set_max_delay -datapath_only 31.250 -from [get_cells -hier -filter {NAME =~ *u_adc/dgray_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *u_adc/g0_reg*}]
+set_max_delay -datapath_only 10.000 -from [get_cells -hier -filter {NAME =~ *u_tl/tgray_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *u_tl/g0_reg*}]
+# The TileLink FIFOs' Gray pointers: bound the skew between bits to the faster clock's period.
+set_max_delay -datapath_only 10.000 -from [get_cells -hier -filter {NAME =~ *u_tl/*/wgray_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *u_tl/*/wg0_reg*}]
+set_max_delay -datapath_only 10.000 -from [get_cells -hier -filter {NAME =~ *u_tl/*/rgray_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *u_tl/*/rg0_reg*}]
+# TL_FRAME only changes while the engine is held in reset.
+set_false_path -from [get_cells -hier -filter {NAME =~ *u_tl/frame_m1_reg*}] -to [get_clocks tl_clk]
+
+# ADC data: centre-aligned DDR. The datasheet gives the window either side of each DCLK edge at
+# 25 and 65 MSPS (9.0 / 3.4 ns, about 0.22 of the period); at 32 MSPS that is ~7 ns, taken as 6.5.
+set adc_dv 6.5
+set_input_delay -clock adc_dclk -max [expr 31.250 / 2 - $adc_dv] [get_ports {ADC_D[*]}]
+set_input_delay -clock adc_dclk -min $adc_dv [get_ports {ADC_D[*]}]
+set_input_delay -clock adc_dclk -clock_fall -max [expr 31.250 / 2 - $adc_dv] [get_ports {ADC_D[*]}] -add_delay
+set_input_delay -clock adc_dclk -clock_fall -min $adc_dv [get_ports {ADC_D[*]}] -add_delay
+
 # Every other pin is either asynchronous (synchronised inside) or a handshake whose strobes
 # are tens of ns wide (FT2232H async FIFO), so there is no I/O timing to close.
-set_false_path -from [get_ports -filter {DIRECTION != OUT && NAME !~ CLK_*}]
+# The TileLink pads have half a TL_CLK period either way (tl_serial.sv) at the rates it runs.
+set_false_path -from [get_ports -filter {DIRECTION != OUT && NAME !~ CLK_* && NAME !~ ADC_D* && NAME != TL_CLK}]
 set_false_path -to [get_ports -filter {DIRECTION != IN}]
